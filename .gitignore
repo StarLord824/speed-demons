@@ -1,0 +1,7 @@
+.out/
+data/
+.data/
+test-data/
+speed-demon-2026/
+*.o
+*.out
