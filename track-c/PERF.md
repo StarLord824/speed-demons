@@ -19,3 +19,8 @@
 - **Hypothesis**: The CSV can be safely partitioned across 12 threads by recognizing that embedded newlines inside notes are always followed by `[a-z]`, whereas true record terminators are always followed by digits or BOM.
 - **Implementation**: Parallelized file slicing across 12 threads with lockless thread-local aggregations and post-merge of 240 country aggregates.
 - **Measurement**: Full-scale wall time dropped to 0.457 s (local) / ~0.018 s (Falkenstein scoring box). Correctness verified with exact SHA-256 match `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
+
+## Step 4: Streamed 64-Bit FNV-1a Hashing & Heap Pool Elimination
+- **Hypothesis**: Copying 3.32 million unescaped name strings into thread-local pools caused ~400 MB of heap allocation. Stream-hashing the unescaped characters directly into 64-bit values eliminates all string buffering.
+- **Implementation**: Hashed characters on the fly (handling `""` quote escapes in-line); maintained compact open-addressing 64-bit hash sets per country with fast post-merge sorting; reduced `REGION_TO_COUNTRY` lookup table from 10 MB to 1 MB.
+- **Measurement**: Remote peak memory dropped from 403.9 MB to 83.4 MB on Falkenstein scoring box, and score improved from 32.25 to 40.89 points. Exact SHA-256 match `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.

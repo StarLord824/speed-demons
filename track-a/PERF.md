@@ -20,7 +20,13 @@
 - **Implementation**: Computed prefix-sum offsets across all active groups. Scattered all 3.1M latencies into a flat array. Used `std::nth_element` on ranks 50, 95, 99.
 - **Measurement**: Wall time dropped to 0.16 s. Peak memory dropped to 15.6 MB.
 
-## Step 4: Parallel Output Formatting & Block Writes
+## Step 4: 2-Pass Zero-Allocation Scatter & Elimination of Intermediate Structs
+- **Hypothesis**: Allocating 3.1 million `ParsedItem` structs (24.8 MB) causes unnecessary memory bus traffic and memory bloat.
+- **Implementation**: In Pass 1, discover and intern endpoints while accumulating per-hour counts into compact local arrays; compute exact group prefix offsets in the single flat `all_latencies` array (12.4 MB); in Pass 2, scatter latencies directly into their target slices with zero intermediate struct allocations.
+- **Measurement**: Remote container peak memory dropped from 59.3 MB to 38.4 MB on Falkenstein scoring hardware.
+
+## Step 5: Parallel Output Formatting & Block Writes
 - **Hypothesis**: Sequential string stream formatting bottlenecks the final phase.
 - **Implementation**: Each thread formats its slice of active groups directly into pre-allocated memory buffers using fast integer-to-string routines, written sequentially to disk.
+- **Verification**: Exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 - **Measurement**: Final full-scale wall time dropped to 0.089 s (local) / ~0.016 s (Falkenstein scoring box). Correctness verified with exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
