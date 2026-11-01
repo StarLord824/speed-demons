@@ -42,7 +42,6 @@ inline uint32_t fnv1a(const char* s, size_t len) {
     return h;
 }
 
-// Fast integer to string formatter
 inline char* u64_to_str(char* buf, uint64_t val) {
     if (val == 0) {
         *buf++ = '0';
@@ -60,18 +59,13 @@ inline char* u64_to_str(char* buf, uint64_t val) {
     return buf;
 }
 
-struct ParsedItem {
-    uint32_t tag; // [31: is_err][30..20: hour][19..0: local_ep_id]
-    uint32_t latency;
-};
-
 struct ThreadData {
-    std::vector<ParsedItem> items;
     std::vector<std::string_view> endpoints;
     uint16_t map_table[8192];
     std::vector<uint16_t> local_to_global;
-    std::vector<uint32_t> group_counts;
-    std::vector<uint32_t> group_errs;
+    // local_counts[hr * 2048 + local_ep]
+    std::vector<uint32_t> local_counts;
+    std::vector<uint32_t> local_errs;
 };
 
 int main(int argc, char** argv) {
@@ -92,6 +86,7 @@ int main(int argc, char** argv) {
     if (file_size == 0) {
         close(fd);
         std::string out_path = out_dir + "/summary.txt";
+        mkdir(out_dir.c_str(), 0777);
         int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
         if (out_fd >= 0) close(out_fd);
         return 0;
@@ -100,10 +95,8 @@ int main(int argc, char** argv) {
     const char* data = (const char*)mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
     if (data == MAP_FAILED) { close(fd); return 1; }
     close(fd);
-    madvise((void*)data, file_size, MADV_WILLNEED | MADV_SEQUENTIAL);
 
     unsigned int num_threads = 12;
-    // On systems with fewer cores, hardware_concurrency is fine, but 12 matches scoring box
     if (num_threads > std::thread::hardware_concurrency() && std::thread::hardware_concurrency() > 0) {
         num_threads = std::thread::hardware_concurrency();
     }
@@ -114,7 +107,7 @@ int main(int argc, char** argv) {
         while (approx < file_size && data[approx] != '\n') {
             approx++;
         }
-        if (approx < file_size) approx++; // first byte after \n
+        if (approx < file_size) approx++;
         chunk_starts[i] = approx;
     }
     chunk_starts[num_threads] = file_size;
@@ -122,23 +115,23 @@ int main(int argc, char** argv) {
     std::vector<ThreadData> tdata(num_threads);
     std::vector<std::thread> workers;
 
+    // PASS 1: Count groups and discover endpoints (zero items allocated!)
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             ThreadData& td = tdata[t];
-            td.items.reserve((chunk_starts[t + 1] - chunk_starts[t]) / 70);
             td.endpoints.reserve(2048);
             std::memset(td.map_table, 0xFF, sizeof(td.map_table));
+            td.local_counts.assign(72 * 2048, 0);
+            td.local_errs.assign(72 * 2048, 0);
 
             const char* ptr = data + chunk_starts[t];
             const char* end = data + chunk_starts[t + 1];
 
             while (ptr < end) {
-                // ts (27 bytes)
                 uint8_t hr = decode_hour(ptr);
-                ptr += 27; // skip ts
-                if (*ptr == ' ') ptr++;
+                ptr += 28; // ts (27) + space (1)
 
-                // method (3-7 bytes)
+                // method
                 while (*ptr != ' ') ptr++;
                 ptr++; // skip space
 
@@ -168,23 +161,20 @@ int main(int argc, char** argv) {
                     slot = (slot + 1) & 8191;
                 }
 
-                // status (3 digits)
+                // status
                 bool is_err = (ptr[0] == '5');
                 ptr += 4; // status (3) + space (1)
 
-                // latency
-                uint32_t lat = 0;
-                while (*ptr >= '0' && *ptr <= '9') {
-                    lat = lat * 10 + (*ptr++ - '0');
-                }
-                if (*ptr == '\n') ptr++;
+                // skip latency digits
+                while (*ptr >= '0' && *ptr <= '9') ptr++;
+                if (ptr < end && *ptr == '\n') ptr++;
 
-                uint32_t tag = ((uint32_t)is_err << 31) | ((uint32_t)hr << 20) | local_ep;
-                td.items.push_back({tag, lat});
+                uint32_t loc_gid = (uint32_t)hr * 2048 + local_ep;
+                td.local_counts[loc_gid]++;
+                if (is_err) td.local_errs[loc_gid]++;
             }
         });
     }
-
     for (auto& w : workers) w.join();
     workers.clear();
 
@@ -218,7 +208,6 @@ int main(int argc, char** argv) {
         td.local_to_global.resize(td.endpoints.size());
         for (size_t l = 0; l < td.endpoints.size(); ++l) {
             std::string_view lep = td.endpoints[l];
-            // Binary search in sorted global_eps
             auto it = std::lower_bound(global_eps.begin(), global_eps.end(), lep,
                 [](std::string_view a, std::string_view b) {
                     size_t min_len = std::min(a.size(), b.size());
@@ -230,44 +219,30 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Parallel counting per group
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            ThreadData& td = tdata[t];
-            td.group_counts.assign(num_groups, 0);
-            td.group_errs.assign(num_groups, 0);
-            for (auto& item : td.items) {
-                uint32_t tag = item.tag;
-                bool is_err = (tag >> 31) != 0;
-                uint32_t hr = (tag >> 20) & 0x7FF;
-                uint16_t loc_ep = tag & 0xFFFF;
-                uint16_t glob_ep = td.local_to_global[loc_ep];
-                uint32_t gid = hr * num_eps + glob_ep;
-                td.group_counts[gid]++;
-                if (is_err) td.group_errs[gid]++;
-                // rewrite tag with global gid
-                item.tag = gid;
-            }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
-
-    // Aggregate group counts and errs, compute offsets
+    // Remap local counts to global group counts
     std::vector<uint32_t> total_counts(num_groups, 0);
     std::vector<uint32_t> total_errs(num_groups, 0);
-    std::vector<uint32_t> group_offsets(num_groups + 1, 0);
+    std::vector<std::vector<uint32_t>> thread_group_counts(num_threads, std::vector<uint32_t>(num_groups, 0));
 
-    for (uint32_t g = 0; g < num_groups; ++g) {
-        uint32_t cnt = 0, err = 0;
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            cnt += tdata[t].group_counts[g];
-            err += tdata[t].group_errs[g];
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        ThreadData& td = tdata[t];
+        for (uint32_t hr = 0; hr < 72; ++hr) {
+            for (size_t loc_ep = 0; loc_ep < td.endpoints.size(); ++loc_ep) {
+                uint32_t c = td.local_counts[hr * 2048 + loc_ep];
+                if (c == 0) continue;
+                uint16_t glob_ep = td.local_to_global[loc_ep];
+                uint32_t gid = hr * num_eps + glob_ep;
+                thread_group_counts[t][gid] = c;
+                total_counts[gid] += c;
+                total_errs[gid] += td.local_errs[hr * 2048 + loc_ep];
+            }
         }
-        total_counts[g] = cnt;
-        total_errs[g] = err;
+        std::vector<uint32_t>().swap(td.local_counts);
+        std::vector<uint32_t>().swap(td.local_errs);
     }
 
+    // Compute prefix sum offsets for all_latencies
+    std::vector<uint32_t> group_offsets(num_groups + 1, 0);
     size_t total_items = 0;
     for (uint32_t g = 0; g < num_groups; ++g) {
         group_offsets[g] = (uint32_t)total_items;
@@ -275,36 +250,74 @@ int main(int argc, char** argv) {
     }
     group_offsets[num_groups] = (uint32_t)total_items;
 
-    // Compute write offsets per thread per group
+    // Compute write cursors per thread
     std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_groups, 0));
     for (uint32_t g = 0; g < num_groups; ++g) {
         uint32_t running = group_offsets[g];
         for (unsigned int t = 0; t < num_threads; ++t) {
             thread_write_offsets[t][g] = running;
-            running += tdata[t].group_counts[g];
+            running += thread_group_counts[t][g];
         }
     }
+    std::vector<std::vector<uint32_t>>().swap(thread_group_counts);
 
     std::vector<uint32_t> all_latencies(total_items);
 
-    // Parallel scatter
+    // PASS 2: Parse latencies and scatter directly into all_latencies (zero intermediate items!)
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             ThreadData& td = tdata[t];
             auto& offsets = thread_write_offsets[t];
-            for (const auto& item : td.items) {
-                uint32_t gid = item.tag;
+
+            const char* ptr = data + chunk_starts[t];
+            const char* end = data + chunk_starts[t + 1];
+
+            while (ptr < end) {
+                uint8_t hr = decode_hour(ptr);
+                ptr += 28;
+
+                while (*ptr != ' ') ptr++;
+                ptr++; // skip space
+
+                const char* ep_start = ptr;
+                while (*ptr != ' ') ptr++;
+                size_t ep_len = ptr - ep_start;
+                ptr++; // skip space
+
+                uint32_t h = fnv1a(ep_start, ep_len);
+                uint32_t slot = h & 8191;
+                uint16_t loc_ep = 0;
+                while (true) {
+                    uint16_t id = td.map_table[slot];
+                    if (id == 0xFFFF) break;
+                    std::string_view existing = td.endpoints[id];
+                    if (existing.size() == ep_len && std::memcmp(existing.data(), ep_start, ep_len) == 0) {
+                        loc_ep = id;
+                        break;
+                    }
+                    slot = (slot + 1) & 8191;
+                }
+
+                ptr += 4; // skip status and space
+
+                uint32_t lat = 0;
+                while (*ptr >= '0' && *ptr <= '9') {
+                    lat = lat * 10 + (*ptr++ - '0');
+                }
+                if (ptr < end && *ptr == '\n') ptr++;
+
+                uint16_t glob_ep = td.local_to_global[loc_ep];
+                uint32_t gid = (uint32_t)hr * num_eps + glob_ep;
                 uint32_t pos = offsets[gid]++;
-                all_latencies[pos] = item.latency;
+                all_latencies[pos] = lat;
             }
-            // Free thread items memory early to drop peak RAM
-            std::vector<ParsedItem>().swap(td.items);
-            std::vector<uint32_t>().swap(td.group_counts);
-            std::vector<uint32_t>().swap(td.group_errs);
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
+
+    std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
+    std::vector<ThreadData>().swap(tdata);
 
     // Collect active group IDs
     std::vector<uint32_t> active_groups;
@@ -314,14 +327,13 @@ int main(int argc, char** argv) {
     }
     size_t num_active = active_groups.size();
 
-    // Struct for final group summary
     struct GroupSummary {
         uint32_t gid;
         uint32_t p50, p95, p99;
     };
     std::vector<GroupSummary> summaries(num_active);
 
-    // Parallel percentiles
+    // PASS 3: Parallel percentile selection via nth_element
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             size_t start_idx = (num_active * t) / num_threads;
@@ -329,110 +341,95 @@ int main(int argc, char** argv) {
 
             for (size_t i = start_idx; i < end_idx; ++i) {
                 uint32_t gid = active_groups[i];
-                uint32_t n = total_counts[gid];
-                uint32_t* span = all_latencies.data() + group_offsets[gid];
+                uint32_t count = total_counts[gid];
+                uint32_t start_pos = group_offsets[gid];
 
-                uint32_t r50 = (uint32_t)((50ULL * n + 99) / 100 - 1);
-                uint32_t r95 = (uint32_t)((95ULL * n + 99) / 100 - 1);
-                uint32_t r99 = (uint32_t)((99ULL * n + 99) / 100 - 1);
+                uint32_t* slice = all_latencies.data() + start_pos;
+                size_t idx50 = (50ULL * count + 99) / 100 - 1;
+                size_t idx95 = (95ULL * count + 99) / 100 - 1;
+                size_t idx99 = (99ULL * count + 99) / 100 - 1;
 
-                if (n == 1) {
-                    summaries[i] = {gid, span[0], span[0], span[0]};
-                } else if (n <= 16) {
-                    std::sort(span, span + n);
-                    summaries[i] = {gid, span[r50], span[r95], span[r99]};
-                } else {
-                    std::nth_element(span, span + r50, span + n);
-                    std::nth_element(span + r50 + 1, span + r95, span + n);
-                    std::nth_element(span + r95 + 1, span + r99, span + n);
-                    summaries[i] = {gid, span[r50], span[r95], span[r99]};
-                }
+                std::nth_element(slice, slice + idx50, slice + count);
+                uint32_t p50 = slice[idx50];
+
+                std::nth_element(slice + idx50, slice + idx95, slice + count);
+                uint32_t p95 = slice[idx95];
+
+                std::nth_element(slice + idx95, slice + idx99, slice + count);
+                uint32_t p99 = slice[idx99];
+
+                summaries[i] = {gid, p50, p95, p99};
             }
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // Parallel output formatting: calculate sizes first
-    std::vector<std::string> thread_buffers(num_threads);
+    // Format output strings in parallel
+    std::vector<std::string> thread_output(num_threads);
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             size_t start_idx = (num_active * t) / num_threads;
             size_t end_idx = (num_active * (t + 1)) / num_threads;
 
-            std::string& buf = thread_buffers[t];
-            buf.reserve((end_idx - start_idx) * 80);
+            std::string& out = thread_output[t];
+            out.reserve((end_idx - start_idx) * 90);
+            char num_buf[32];
 
-            char line_buf[256];
             for (size_t i = start_idx; i < end_idx; ++i) {
                 const auto& sum = summaries[i];
                 uint32_t gid = sum.gid;
                 uint32_t hr = gid / num_eps;
                 uint32_t epid = gid % num_eps;
+                uint32_t count = total_counts[gid];
+                uint32_t errors = total_errs[gid];
+                uint64_t ppm = ((uint64_t)errors * 1000000ULL) / count;
+
+                out.append(HOURS_STR[hr]);
+                out.push_back(' ');
+
                 std::string_view ep = global_eps[epid];
+                out.append(ep.data(), ep.size());
+                out.push_back(' ');
 
-                uint32_t cnt = total_counts[gid];
-                uint32_t errs = total_errs[gid];
-                uint32_t ppm = (uint32_t)((uint64_t)errs * 1000000ULL / cnt);
+                char* p = u64_to_str(num_buf, count);
+                out.append(num_buf, p - num_buf);
+                out.push_back(' ');
 
-                char* p = line_buf;
-                // Hour (20 bytes)
-                std::memcpy(p, HOURS_STR[hr], 20);
-                p += 20;
-                *p++ = ' ';
+                p = u64_to_str(num_buf, sum.p50);
+                out.append(num_buf, p - num_buf);
+                out.push_back(' ');
 
-                // Endpoint
-                std::memcpy(p, ep.data(), ep.size());
-                p += ep.size();
-                *p++ = ' ';
+                p = u64_to_str(num_buf, sum.p95);
+                out.append(num_buf, p - num_buf);
+                out.push_back(' ');
 
-                // count
-                p = u64_to_str(p, cnt);
-                *p++ = ' ';
+                p = u64_to_str(num_buf, sum.p99);
+                out.append(num_buf, p - num_buf);
+                out.push_back(' ');
 
-                // p50
-                p = u64_to_str(p, sum.p50);
-                *p++ = ' ';
+                p = u64_to_str(num_buf, errors);
+                out.append(num_buf, p - num_buf);
+                out.push_back(' ');
 
-                // p95
-                p = u64_to_str(p, sum.p95);
-                *p++ = ' ';
-
-                // p99
-                p = u64_to_str(p, sum.p99);
-                *p++ = ' ';
-
-                // errors
-                p = u64_to_str(p, errs);
-                *p++ = ' ';
-
-                // ppm
-                p = u64_to_str(p, ppm);
-                *p++ = '\n';
-
-                buf.append(line_buf, p - line_buf);
+                p = u64_to_str(num_buf, ppm);
+                out.append(num_buf, p - num_buf);
+                out.push_back('\n');
             }
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // Write to output file
     mkdir(out_dir.c_str(), 0777);
     std::string out_path = out_dir + "/summary.txt";
     int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
-    if (out_fd < 0) return 1;
-
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        const std::string& buf = thread_buffers[t];
-        size_t written = 0;
-        while (written < buf.size()) {
-            ssize_t ret = write(out_fd, buf.data() + written, buf.size() - written);
-            if (ret <= 0) break;
-            written += ret;
+    if (out_fd >= 0) {
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            write(out_fd, thread_output[t].data(), thread_output[t].size());
         }
+        close(out_fd);
     }
-    close(out_fd);
     munmap((void*)data, file_size);
 
     return 0;
