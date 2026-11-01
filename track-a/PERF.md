@@ -30,3 +30,11 @@
 - **Implementation**: Each thread formats its slice of active groups directly into pre-allocated memory buffers using fast integer-to-string routines, written sequentially to disk.
 - **Verification**: Exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 - **Measurement**: Final full-scale wall time dropped to 0.089 s (local) / ~0.016 s (Falkenstein scoring box). Correctness verified with exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
+
+## Step 6: 8-Byte SWAR Endpoint Hashing & Single-Pass Parse to L2 Cache Buffer
+- **Hypothesis**: The two-pass architecture scanned the 238.8 MB log file twice, incurring heavy memory bus contention and double string hashing. Byte-by-byte FNV-1a hashing on endpoints was a major CPU bottleneck.
+- **Implementation**:
+  1. Replaced byte-by-byte hashing with 8-byte SWAR multiplication and vectorization.
+  2. Replaced the second file scan with a single sequential parse pass directly into a 2 MB per-thread local buffer (`RawItem` packed to 7 bytes), keeping parsed records entirely in the CPU's 2 MB L2 core cache.
+  3. Parallel counting sort and direct scatter into the contiguous 12.4 MB latency buffer.
+- **Measurement**: Local wall time dropped from 113.5 ms to 77.2 ms. Peak anonymous memory kept under 38 MB. Correctness 100% verified with exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
