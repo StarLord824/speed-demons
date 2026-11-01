@@ -1,7 +1,6 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <string_view>
 #include <algorithm>
 #include <thread>
 #include <cstring>
@@ -20,69 +19,46 @@ struct CountryInfo {
 static CountryInfo COUNTRIES[256];
 static uint32_t NUM_COUNTRIES = 0;
 
-inline uint32_t fnv1a_32(const char* s, size_t len) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= (uint8_t)s[i];
-        h *= 16777619u;
-    }
-    return h;
+inline uint64_t fnv1a_64_update(uint64_t h, uint8_t b) {
+    return (h ^ b) * 1099511628211ULL;
 }
 
-struct NameHashSet {
-    struct Slot {
-        uint32_t hash;
-        uint32_t offset;
-        uint16_t len;
-        uint16_t pad;
-    };
-    std::vector<Slot> slots;
+// Compact open-addressing 64-bit hash set
+struct Hash64Set {
+    std::vector<uint64_t> slots;
     uint32_t mask = 0;
     uint32_t count = 0;
 
     void init(uint32_t cap_pow2) {
-        slots.assign(cap_pow2, {0, 0, 0, 0});
+        slots.assign(cap_pow2, 0);
         mask = cap_pow2 - 1;
         count = 0;
     }
 
-    // Returns true if inserted (was not present), false if already present
-    bool insert_or_find(const char* name_ptr, uint16_t len, uint32_t h,
-                        std::vector<char>& pool) {
-        if (h == 0) h = 1;
-        uint32_t idx = h & mask;
-        while (slots[idx].hash != 0) {
-            if (slots[idx].hash == h && slots[idx].len == len) {
-                if (std::memcmp(pool.data() + slots[idx].offset, name_ptr, len) == 0) {
-                    return false; // already present
-                }
-            }
+    void insert(uint64_t val) {
+        if (val == 0) val = 1;
+        uint32_t idx = (uint32_t)val & mask;
+        while (slots[idx] != 0) {
+            if (slots[idx] == val) return;
             idx = (idx + 1) & mask;
         }
-
-        // Not present: append to pool and store in slot
-        uint32_t off = (uint32_t)pool.size();
-        pool.insert(pool.end(), name_ptr, name_ptr + len);
-        slots[idx] = {h, off, len, 0};
+        slots[idx] = val;
         count++;
 
         if (count * 2 > mask) {
             uint32_t new_cap = (mask + 1) * 2;
-            std::vector<Slot> old = std::move(slots);
+            std::vector<uint64_t> old = std::move(slots);
             uint32_t old_count = count;
             init(new_cap);
-            for (const auto& s : old) {
-                if (s.hash != 0) {
-                    uint32_t nidx = s.hash & mask;
-                    while (slots[nidx].hash != 0) {
-                        nidx = (nidx + 1) & mask;
-                    }
-                    slots[nidx] = s;
+            for (uint64_t v : old) {
+                if (v != 0) {
+                    uint32_t nidx = (uint32_t)v & mask;
+                    while (slots[nidx] != 0) nidx = (nidx + 1) & mask;
+                    slots[nidx] = v;
                 }
             }
             count = old_count;
         }
-        return true;
     }
 };
 
@@ -95,12 +71,11 @@ struct ThreadCountryAgg {
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
     bool has_record = false;
-    NameHashSet name_set;
+    Hash64Set name_hashes;
 };
 
 struct ThreadContext {
     ThreadCountryAgg aggs[256];
-    std::vector<char> pool;
 };
 
 inline char* u64_to_str(char* buf, uint64_t val) {
@@ -145,6 +120,7 @@ int main(int argc, char** argv) {
 
     std::memset(REGION_TO_COUNTRY, 0xFF, sizeof(REGION_TO_COUNTRY));
 
+    // 1. Parse regions.csv
     std::string reg_path = data_dir + "/regions.csv";
     int rfd = open(reg_path.c_str(), O_RDONLY);
     if (rfd < 0) return 1;
@@ -207,7 +183,6 @@ int main(int argc, char** argv) {
     size_t rec_size = rec_st.st_size;
     const char* rec_data = (const char*)mmap(nullptr, rec_size, PROT_READ, MAP_SHARED, rec_fd, 0);
     close(rec_fd);
-    madvise((void*)rec_data, rec_size, MADV_WILLNEED | MADV_SEQUENTIAL);
 
     const char* file_start = rec_data;
     const char* file_end = rec_data + rec_size;
@@ -247,9 +222,8 @@ int main(int argc, char** argv) {
 
     std::vector<ThreadContext> tcontexts(num_threads);
     for (unsigned int t = 0; t < num_threads; ++t) {
-        tcontexts[t].pool.reserve(65536);
         for (int c = 0; c < 256; ++c) {
-            tcontexts[t].aggs[c].name_set.init(256);
+            tcontexts[t].aggs[c].name_hashes.init(128);
         }
     }
 
@@ -259,8 +233,6 @@ int main(int argc, char** argv) {
             const char* ptr = chunk_starts[t];
             const char* end = chunk_starts[t + 1];
             auto& aggs = tcontexts[t].aggs;
-            auto& pool = tcontexts[t].pool;
-            char unescaped_buf[256];
 
             while (ptr < end) {
                 // Check mid-file BOM
@@ -276,54 +248,36 @@ int main(int argc, char** argv) {
                 }
                 ptr++; // skip ','
 
-                // 2. name
-                const char* name_ptr = nullptr;
+                // 2. name: stream fnv1a_64 directly without buffering
+                uint64_t nhash = 14695981039346656037ULL;
                 uint16_t name_len = 0;
-                bool has_escape = false;
 
                 if (*ptr == '"') {
                     ptr++; // skip opening quote
-                    const char* nstart = ptr;
                     while (ptr < end) {
                         if (*ptr == '"') {
                             if (ptr + 1 < end && *(ptr + 1) == '"') {
-                                has_escape = true;
+                                nhash = fnv1a_64_update(nhash, '"');
+                                name_len++;
                                 ptr += 2;
                             } else {
                                 ptr++; // skip closing quote
                                 break;
                             }
                         } else {
-                            ptr++;
+                            nhash = fnv1a_64_update(nhash, (uint8_t)*ptr++);
+                            name_len++;
                         }
-                    }
-                    if (!has_escape) {
-                        name_ptr = nstart;
-                        name_len = (uint16_t)(ptr - 1 - nstart);
-                    } else {
-                        // Unescape into stack buffer
-                        const char* cur = nstart;
-                        uint16_t ulen = 0;
-                        while (cur < ptr - 1) {
-                            if (*cur == '"' && *(cur + 1) == '"') {
-                                unescaped_buf[ulen++] = '"';
-                                cur += 2;
-                            } else {
-                                unescaped_buf[ulen++] = *cur++;
-                            }
-                        }
-                        name_ptr = unescaped_buf;
-                        name_len = ulen;
                     }
                 } else {
-                    const char* nstart = ptr;
-                    while (ptr < end && *ptr != ',') ptr++;
-                    name_ptr = nstart;
-                    name_len = (uint16_t)(ptr - nstart);
+                    while (ptr < end && *ptr != ',') {
+                        nhash = fnv1a_64_update(nhash, (uint8_t)*ptr++);
+                        name_len++;
+                    }
                 }
                 ptr++; // skip ','
 
-                // 3. note
+                // 3. note: only track byte count
                 uint32_t note_bytes = 0;
                 if (*ptr == '"') {
                     ptr++; // skip opening quote
@@ -392,9 +346,7 @@ int main(int argc, char** argv) {
                     agg.note_bytes += note_bytes;
                 }
 
-                // Insert into distinct names set
-                uint32_t nhash = fnv1a_32(name_ptr, name_len);
-                agg.name_set.insert_or_find(name_ptr, name_len, nhash, pool);
+                agg.name_hashes.insert(nhash);
             }
         });
     }
@@ -447,27 +399,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Merge distinct names per country
+    // Merge distinct names per country via fast sorting
+    std::vector<uint64_t> merged_hashes;
+    merged_hashes.reserve(8192);
+
     for (int c = 0; c < 256; ++c) {
         if (!final_aggs[c].has_record) continue;
-
-        NameHashSet merged_set;
-        merged_set.init(1024);
-        std::vector<char> merged_pool;
-        merged_pool.reserve(16384);
-
+        merged_hashes.clear();
         for (unsigned int t = 0; t < num_threads; ++t) {
-            const auto& nset = tcontexts[t].aggs[c].name_set;
-            const auto& tpool = tcontexts[t].pool;
-            for (const auto& slot : nset.slots) {
-                if (slot.hash != 0) {
-                    const char* s_ptr = tpool.data() + slot.offset;
-                    merged_set.insert_or_find(s_ptr, slot.len, slot.hash, merged_pool);
-                }
+            const auto& nset = tcontexts[t].aggs[c].name_hashes;
+            for (uint64_t v : nset.slots) {
+                if (v != 0) merged_hashes.push_back(v);
             }
         }
-        final_aggs[c].names_distinct = merged_set.count;
+        std::sort(merged_hashes.begin(), merged_hashes.end());
+        final_aggs[c].names_distinct = (uint64_t)(std::unique(merged_hashes.begin(), merged_hashes.end()) - merged_hashes.begin());
     }
+
+    // Free thread contexts immediately
+    std::vector<ThreadContext>().swap(tcontexts);
 
     // Filter active and sort
     std::vector<FinalAgg> active;
