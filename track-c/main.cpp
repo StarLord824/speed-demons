@@ -3,64 +3,35 @@
 #include <string>
 #include <algorithm>
 #include <thread>
+#include <atomic>
 #include <cstring>
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-// regions.csv IDs are in [1..999,999]. Anything >= 1,000,000 is UNMATCHED.
+// regions.csv IDs are in [1..999,999]. Anything >= 1,000,000 is UNMATCHED (255).
 static uint8_t REGION_TO_COUNTRY[1000000];
 
 struct CountryInfo {
     char code[4];
 };
-
 static CountryInfo COUNTRIES[256];
 static uint32_t NUM_COUNTRIES = 0;
+static uint16_t CODE_TO_CID[26 * 26 * 26];
 
 inline uint64_t fnv1a_64_update(uint64_t h, uint8_t b) {
     return (h ^ b) * 1099511628211ULL;
 }
 
-// Compact open-addressing 64-bit hash set
-struct Hash64Set {
-    std::vector<uint64_t> slots;
-    uint32_t mask = 0;
-    uint32_t count = 0;
+// Global lock-free 262,144 slot hash table mapping 64-bit hash -> slot index
+static const uint32_t TABLE_SIZE = 262144;
+static const uint32_t TABLE_MASK = TABLE_SIZE - 1;
+static std::atomic<uint64_t> NAME_TABLE[TABLE_SIZE];
 
-    void init(uint32_t cap_pow2) {
-        slots.assign(cap_pow2, 0);
-        mask = cap_pow2 - 1;
-        count = 0;
-    }
-
-    void insert(uint64_t val) {
-        if (val == 0) val = 1;
-        uint32_t idx = (uint32_t)val & mask;
-        while (slots[idx] != 0) {
-            if (slots[idx] == val) return;
-            idx = (idx + 1) & mask;
-        }
-        slots[idx] = val;
-        count++;
-
-        if (count * 2 > mask) {
-            uint32_t new_cap = (mask + 1) * 2;
-            std::vector<uint64_t> old = std::move(slots);
-            uint32_t old_count = count;
-            init(new_cap);
-            for (uint64_t v : old) {
-                if (v != 0) {
-                    uint32_t nidx = (uint32_t)v & mask;
-                    while (slots[nidx] != 0) nidx = (nidx + 1) & mask;
-                    slots[nidx] = v;
-                }
-            }
-            count = old_count;
-        }
-    }
-};
+// Bitset: 256 countries x 4096 uint64 = 8 MB
+static std::atomic<uint64_t> COUNTRY_BITS[256][4096];
 
 struct ThreadCountryAgg {
     uint64_t count = 0;
@@ -71,7 +42,6 @@ struct ThreadCountryAgg {
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
     bool has_record = false;
-    Hash64Set name_hashes;
 };
 
 struct ThreadContext {
@@ -119,13 +89,14 @@ int main(int argc, char** argv) {
     }
 
     std::memset(REGION_TO_COUNTRY, 0xFF, sizeof(REGION_TO_COUNTRY));
+    std::memset(CODE_TO_CID, 0xFF, sizeof(CODE_TO_CID));
 
     // 1. Parse regions.csv
     std::string reg_path = data_dir + "/regions.csv";
     int rfd = open(reg_path.c_str(), O_RDONLY);
     if (rfd < 0) return 1;
     struct stat rst;
-    if (fstat(rfd, &rst) < 0) { close(rfd); return 1; }
+    fstat(rfd, &rst);
     size_t rsize = rst.st_size;
     const char* rdata = (const char*)mmap(nullptr, rsize, PROT_READ, MAP_SHARED, rfd, 0);
     close(rfd);
@@ -136,18 +107,18 @@ int main(int argc, char** argv) {
     if (rptr < rend && *rptr == '\n') rptr++;
 
     auto get_country_id = [&](const char* code) -> uint8_t {
-        for (uint32_t i = 0; i < NUM_COUNTRIES; ++i) {
-            if (COUNTRIES[i].code[0] == code[0] &&
-                COUNTRIES[i].code[1] == code[1] &&
-                COUNTRIES[i].code[2] == code[2]) {
-                return (uint8_t)i;
-            }
-        }
+        uint32_t code_idx = (uint32_t)(code[0] - 'A') * 676 +
+                            (uint32_t)(code[1] - 'A') * 26 +
+                            (uint32_t)(code[2] - 'A');
+        uint16_t cid = CODE_TO_CID[code_idx];
+        if (cid != 0xFFFF) return (uint8_t)cid;
+
         uint8_t id = (uint8_t)NUM_COUNTRIES++;
         COUNTRIES[id].code[0] = code[0];
         COUNTRIES[id].code[1] = code[1];
         COUNTRIES[id].code[2] = code[2];
         COUNTRIES[id].code[3] = '\0';
+        CODE_TO_CID[code_idx] = id;
         return id;
     };
 
@@ -179,7 +150,7 @@ int main(int argc, char** argv) {
     int rec_fd = open(rec_path.c_str(), O_RDONLY);
     if (rec_fd < 0) return 1;
     struct stat rec_st;
-    if (fstat(rec_fd, &rec_st) < 0) { close(rec_fd); return 1; }
+    fstat(rec_fd, &rec_st);
     size_t rec_size = rec_st.st_size;
     const char* rec_data = (const char*)mmap(nullptr, rec_size, PROT_READ, MAP_SHARED, rec_fd, 0);
     close(rec_fd);
@@ -187,11 +158,9 @@ int main(int argc, char** argv) {
     const char* file_start = rec_data;
     const char* file_end = rec_data + rec_size;
 
-    // Skip initial BOM
     if (file_start + 3 <= file_end && (uint8_t)file_start[0] == 0xEF && (uint8_t)file_start[1] == 0xBB && (uint8_t)file_start[2] == 0xBF) {
         file_start += 3;
     }
-    // Skip header line
     while (file_start < file_end && *file_start != '\n') file_start++;
     if (file_start < file_end && *file_start == '\n') file_start++;
 
@@ -221,13 +190,8 @@ int main(int argc, char** argv) {
     }
 
     std::vector<ThreadContext> tcontexts(num_threads);
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        for (int c = 0; c < 256; ++c) {
-            tcontexts[t].aggs[c].name_hashes.init(128);
-        }
-    }
-
     std::vector<std::thread> workers;
+
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             const char* ptr = chunk_starts[t];
@@ -235,7 +199,6 @@ int main(int argc, char** argv) {
             auto& aggs = tcontexts[t].aggs;
 
             while (ptr < end) {
-                // Check mid-file BOM
                 if (ptr + 3 <= end && (uint8_t)ptr[0] == 0xEF && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) {
                     ptr += 3;
                 }
@@ -248,12 +211,12 @@ int main(int argc, char** argv) {
                 }
                 ptr++; // skip ','
 
-                // 2. name: stream fnv1a_64 directly without buffering
+                // 2. name: stream fnv1a_64 directly
                 uint64_t nhash = 14695981039346656037ULL;
                 uint16_t name_len = 0;
 
                 if (*ptr == '"') {
-                    ptr++; // skip opening quote
+                    ptr++;
                     while (ptr < end) {
                         if (*ptr == '"') {
                             if (ptr + 1 < end && *(ptr + 1) == '"') {
@@ -261,7 +224,7 @@ int main(int argc, char** argv) {
                                 name_len++;
                                 ptr += 2;
                             } else {
-                                ptr++; // skip closing quote
+                                ptr++;
                                 break;
                             }
                         } else {
@@ -280,14 +243,14 @@ int main(int argc, char** argv) {
                 // 3. note: only track byte count
                 uint32_t note_bytes = 0;
                 if (*ptr == '"') {
-                    ptr++; // skip opening quote
+                    ptr++;
                     while (ptr < end) {
                         if (*ptr == '"') {
                             if (ptr + 1 < end && *(ptr + 1) == '"') {
                                 note_bytes++;
                                 ptr += 2;
                             } else {
-                                ptr++; // skip closing quote
+                                ptr++;
                                 break;
                             }
                         } else {
@@ -346,17 +309,32 @@ int main(int argc, char** argv) {
                     agg.note_bytes += note_bytes;
                 }
 
-                agg.name_hashes.insert(nhash);
+                // Global Lock-Free Name Slot Lookup
+                if (nhash == 0) nhash = 1;
+                uint32_t slot = (uint32_t)nhash & TABLE_MASK;
+                while (true) {
+                    uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
+                    if (val == nhash) break;
+                    if (val == 0) {
+                        uint64_t expected = 0;
+                        if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
+                            break;
+                        }
+                        if (expected == nhash) break;
+                    }
+                    slot = (slot + 1) & TABLE_MASK;
+                }
+
+                // Mark bit in country bitset
+                COUNTRY_BITS[cid][slot >> 6].fetch_or(1ULL << (slot & 63), std::memory_order_relaxed);
             }
         });
     }
 
     for (auto& w : workers) w.join();
     workers.clear();
-
     munmap((void*)rec_data, rec_size);
 
-    // Merge aggregations across all threads into AGGS[256]
     struct FinalAgg {
         uint64_t count = 0;
         int64_t id_sum = 0;
@@ -397,41 +375,25 @@ int main(int argc, char** argv) {
                 final_aggs[c].note_bytes += tagg.note_bytes;
             }
         }
-    }
 
-    // Merge distinct names per country via fast sorting
-    std::vector<uint64_t> merged_hashes;
-    merged_hashes.reserve(8192);
-
-    for (int c = 0; c < 256; ++c) {
-        if (!final_aggs[c].has_record) continue;
-        merged_hashes.clear();
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            const auto& nset = tcontexts[t].aggs[c].name_hashes;
-            for (uint64_t v : nset.slots) {
-                if (v != 0) merged_hashes.push_back(v);
+        if (final_aggs[c].has_record) {
+            uint64_t dist = 0;
+            for (int w = 0; w < 4096; ++w) {
+                uint64_t bits = COUNTRY_BITS[c][w].load(std::memory_order_relaxed);
+                if (bits) dist += std::popcount(bits);
             }
+            final_aggs[c].names_distinct = dist;
         }
-        std::sort(merged_hashes.begin(), merged_hashes.end());
-        final_aggs[c].names_distinct = (uint64_t)(std::unique(merged_hashes.begin(), merged_hashes.end()) - merged_hashes.begin());
     }
 
-    // Free thread contexts immediately
-    std::vector<ThreadContext>().swap(tcontexts);
-
-    // Filter active and sort
     std::vector<FinalAgg> active;
     for (int c = 0; c < 256; ++c) {
-        if (final_aggs[c].has_record) {
-            active.push_back(final_aggs[c]);
-        }
+        if (final_aggs[c].has_record) active.push_back(final_aggs[c]);
     }
-
     std::sort(active.begin(), active.end(), [](const FinalAgg& a, const FinalAgg& b) {
         return a.country_code < b.country_code;
     });
 
-    // Format output buffer
     std::string out_buf;
     out_buf.reserve(65536);
     char num_tmp[64];
@@ -473,8 +435,8 @@ int main(int argc, char** argv) {
         out_buf.push_back('\n');
     }
 
-    std::string out_path = out_dir + "/aggregates.txt";
     mkdir(out_dir.c_str(), 0777);
+    std::string out_path = out_dir + "/aggregates.txt";
     int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (out_fd >= 0) {
         write(out_fd, out_buf.data(), out_buf.size());
