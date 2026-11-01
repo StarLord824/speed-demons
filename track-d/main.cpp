@@ -278,9 +278,9 @@ int main(int argc, char** argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // 4. Parallel query answering with 4 threads
-    unsigned int num_query_threads = 4;
-    if (num_query_threads > std::thread::hardware_concurrency() && std::thread::hardware_concurrency() > 0) {
+    // 4. Parallel query answering with 12 threads
+    unsigned int num_query_threads = 12;
+    if (std::thread::hardware_concurrency() > 0 && num_query_threads > std::thread::hardware_concurrency()) {
         num_query_threads = std::thread::hardware_concurrency();
     }
 
