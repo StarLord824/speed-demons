@@ -24,3 +24,12 @@
 - **Hypothesis**: Re-constructing bitsets for frequently occurring words (like `the`, `and`, `of`) across 50,000 queries caused over 2 billion redundant bit operations. Re-tokenizing candidate documents with heap `std::string` allocations caused allocator churn.
 - **Implementation**: Pre-materialize 31 KB bitsets once for frequently queried terms ($df \ge 64$ and query frequency $\ge 3$); verify candidate documents in phrase queries by tokenizing directly into a 1024-element `uint32_t` stack array, eliminating all heap string allocations.
 - **Measurement**: Reduced retired instructions by ~3.6 billion and eliminated all heap churn during phrase checking. Correctness verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+## Step 5: Contiguous Flat CSR Postings, Parallel Slicing & O(1) Bit-Sum Table
+- **Hypothesis**: In Step 4, allocating 31 KB bitsets for ~6,000 terms blew peak RSS to 472 MB. Moreover, allocating 908,964 separate `std::vector<uint32_t>` objects caused extreme heap fragmentation and cache thrashing. Slicing `docs.txt` single-threaded cost 123 ms, and extracting set bits for sum computation took hundreds of iterations per word.
+- **Implementation**:
+  1. Replaced all 75k `std::vector<uint32_t>` postings lists with a single flat CSR array `postings_data` (84.8 MB) and `postings_head`, constructed via a 2-pass parallel scatter with zero dynamic resizing.
+  2. Restricted precomputed bitsets strictly to the top ~138 hot terms ($df \ge 1000$ and query frequency $\ge 50$), dropping bitset memory from 187 MB to 4.3 MB.
+  3. Parallelized `docs.txt` line slicing across 12 threads.
+  4. Implemented a 16-bit lookup table `WORD_BIT_SUM` to compute set-bit position sums in $O(1)$ instructions without looping over individual bits.
+- **Measurement**: Peak memory dropped by >350 MB down to ~100 MB. Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.

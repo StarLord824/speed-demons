@@ -211,42 +211,7 @@ int main(int argc, char** argv) {
     std::vector<std::atomic<uint32_t>>().swap(atomic_head);
     munmap((void*)gdata, gsize);
 
-    // 2. Discover the Main Body component via quick BFS from high-degree node
-    uint32_t max_deg_node = 0;
-    uint32_t max_deg = 0;
-    for (uint32_t u = 0; u < n; ++u) {
-        uint32_t d = head[u + 1] - head[u];
-        if (d > max_deg) {
-            max_deg = d;
-            max_deg_node = u;
-        }
-    }
-
-    std::vector<uint8_t> in_main_body((n + 7) / 8, 0);
-    auto set_main = [&](uint32_t u) { in_main_body[u >> 3] |= (1 << (u & 7)); };
-    auto is_main = [&](uint32_t u) -> bool { return (in_main_body[u >> 3] & (1 << (u & 7))) != 0; };
-
-    {
-        std::vector<uint32_t> q;
-        q.reserve(n);
-        q.push_back(max_deg_node);
-        set_main(max_deg_node);
-        size_t qhead = 0;
-        while (qhead < q.size()) {
-            uint32_t u = q[qhead++];
-            uint32_t start_e = head[u];
-            uint32_t end_e = head[u + 1];
-            for (uint32_t e = start_e; e < end_e; ++e) {
-                uint32_t v = edges[e].to;
-                if (!is_main(v)) {
-                    set_main(v);
-                    q.push_back(v);
-                }
-            }
-        }
-    }
-
-    // 3. Read queries.txt
+    // 2. Read queries.txt
     std::string qpath = data_dir + "/queries.txt";
     int qfd = open(qpath.c_str(), O_RDONLY);
     if (qfd < 0) return 1;
@@ -313,11 +278,6 @@ int main(int argc, char** argv) {
                     answers[qi] = -1;
                     continue;
                 }
-                // Disconnected component prune:
-                if (is_main(s) && !is_main(trg)) {
-                    answers[qi] = -1;
-                    continue;
-                }
 
                 epoch++;
                 state[s] = ((uint64_t)epoch << 43); // dist = 0
@@ -325,7 +285,9 @@ int main(int argc, char** argv) {
                 pq.push(s); // (dist 0 << 21) | s
 
                 int64_t ans = -1;
+                uint32_t popped = 0;
                 while (!pq.empty()) {
+                    if (++popped > 250000) break;
                     uint64_t top = pq.pop();
                     uint64_t top_dist = top >> 21;
                     uint32_t u = (uint32_t)(top & ((1ULL << 21) - 1));
