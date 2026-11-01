@@ -10,8 +10,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-// At most 10,000,000 region IDs
-static uint8_t REGION_TO_COUNTRY[10000000];
+// regions.csv IDs are in [1..999,999]. Anything >= 1,000,000 is UNMATCHED.
+static uint8_t REGION_TO_COUNTRY[1000000];
 
 struct CountryInfo {
     char code[4];
@@ -20,59 +20,73 @@ struct CountryInfo {
 static CountryInfo COUNTRIES[256];
 static uint32_t NUM_COUNTRIES = 0;
 
-inline uint64_t fnv1a_64(const char* s, size_t len) {
-    uint64_t h = 14695981039346656037ULL;
+inline uint32_t fnv1a_32(const char* s, size_t len) {
+    uint32_t h = 2166136261u;
     for (size_t i = 0; i < len; ++i) {
         h ^= (uint8_t)s[i];
-        h *= 1099511628211ULL;
+        h *= 16777619u;
     }
     return h;
 }
 
-// Flat open-addressing hash set for distinct names
 struct NameHashSet {
     struct Slot {
-        uint64_t hash;
+        uint32_t hash;
         uint32_t offset;
         uint16_t len;
+        uint16_t pad;
     };
     std::vector<Slot> slots;
     uint32_t mask = 0;
     uint32_t count = 0;
 
     void init(uint32_t cap_pow2) {
-        slots.assign(cap_pow2, {0, 0, 0});
+        slots.assign(cap_pow2, {0, 0, 0, 0});
         mask = cap_pow2 - 1;
         count = 0;
     }
 
-    void insert(uint64_t h, uint32_t off, uint16_t len, const char* str_pool) {
+    // Returns true if inserted (was not present), false if already present
+    bool insert_or_find(const char* name_ptr, uint16_t len, uint32_t h,
+                        std::vector<char>& pool) {
         if (h == 0) h = 1;
-        uint32_t idx = (uint32_t)h & mask;
+        uint32_t idx = h & mask;
         while (slots[idx].hash != 0) {
             if (slots[idx].hash == h && slots[idx].len == len) {
-                if (std::memcmp(str_pool + slots[idx].offset, str_pool + off, len) == 0) {
-                    return;
+                if (std::memcmp(pool.data() + slots[idx].offset, name_ptr, len) == 0) {
+                    return false; // already present
                 }
             }
             idx = (idx + 1) & mask;
         }
-        slots[idx] = {h, off, len};
+
+        // Not present: append to pool and store in slot
+        uint32_t off = (uint32_t)pool.size();
+        pool.insert(pool.end(), name_ptr, name_ptr + len);
+        slots[idx] = {h, off, len, 0};
         count++;
+
         if (count * 2 > mask) {
             uint32_t new_cap = (mask + 1) * 2;
             std::vector<Slot> old = std::move(slots);
+            uint32_t old_count = count;
             init(new_cap);
             for (const auto& s : old) {
                 if (s.hash != 0) {
-                    insert(s.hash, s.offset, s.len, str_pool);
+                    uint32_t nidx = s.hash & mask;
+                    while (slots[nidx].hash != 0) {
+                        nidx = (nidx + 1) & mask;
+                    }
+                    slots[nidx] = s;
                 }
             }
+            count = old_count;
         }
+        return true;
     }
 };
 
-struct ThreadAgg {
+struct ThreadCountryAgg {
     uint64_t count = 0;
     int64_t id_sum = 0;
     int64_t amount_sum = 0;
@@ -82,7 +96,11 @@ struct ThreadAgg {
     uint64_t note_bytes = 0;
     bool has_record = false;
     NameHashSet name_set;
-    std::vector<char> name_pool;
+};
+
+struct ThreadContext {
+    ThreadCountryAgg aggs[256];
+    std::vector<char> pool;
 };
 
 inline char* u64_to_str(char* buf, uint64_t val) {
@@ -107,7 +125,6 @@ inline char* format_cents(char* buf, int64_t cents) {
     return buf;
 }
 
-// Check if ptr is at the start of a record
 inline bool is_record_start(const char* ptr, const char* end) {
     if (ptr >= end) return false;
     if (ptr + 3 <= end && (uint8_t)ptr[0] == 0xEF && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) {
@@ -171,7 +188,7 @@ int main(int argc, char** argv) {
         if (*rptr == '\n') rptr++;
 
         uint8_t cid = get_country_id(code);
-        if (reg_id < 10000000) {
+        if (reg_id < 1000000) {
             REGION_TO_COUNTRY[reg_id] = cid;
         }
     }
@@ -228,11 +245,11 @@ int main(int argc, char** argv) {
         chunk_starts[t] = approx;
     }
 
-    std::vector<std::vector<ThreadAgg>> thread_aggs(num_threads);
+    std::vector<ThreadContext> tcontexts(num_threads);
     for (unsigned int t = 0; t < num_threads; ++t) {
-        thread_aggs[t].resize(256);
+        tcontexts[t].pool.reserve(65536);
         for (int c = 0; c < 256; ++c) {
-            thread_aggs[t][c].name_set.init(256);
+            tcontexts[t].aggs[c].name_set.init(256);
         }
     }
 
@@ -241,7 +258,9 @@ int main(int argc, char** argv) {
         workers.emplace_back([&, t]() {
             const char* ptr = chunk_starts[t];
             const char* end = chunk_starts[t + 1];
-            auto& aggs = thread_aggs[t];
+            auto& aggs = tcontexts[t].aggs;
+            auto& pool = tcontexts[t].pool;
+            char unescaped_buf[256];
 
             while (ptr < end) {
                 // Check mid-file BOM
@@ -258,33 +277,49 @@ int main(int argc, char** argv) {
                 ptr++; // skip ','
 
                 // 2. name
-                const char* name_unescaped_start = ptr;
-                uint32_t name_bytes = 0;
-                bool name_has_escapes = false;
+                const char* name_ptr = nullptr;
+                uint16_t name_len = 0;
+                bool has_escape = false;
 
                 if (*ptr == '"') {
                     ptr++; // skip opening quote
-                    name_unescaped_start = ptr;
+                    const char* nstart = ptr;
                     while (ptr < end) {
                         if (*ptr == '"') {
                             if (ptr + 1 < end && *(ptr + 1) == '"') {
-                                name_has_escapes = true;
-                                name_bytes++;
+                                has_escape = true;
                                 ptr += 2;
                             } else {
                                 ptr++; // skip closing quote
                                 break;
                             }
                         } else {
-                            name_bytes++;
                             ptr++;
                         }
                     }
-                } else {
-                    while (ptr < end && *ptr != ',') {
-                        name_bytes++;
-                        ptr++;
+                    if (!has_escape) {
+                        name_ptr = nstart;
+                        name_len = (uint16_t)(ptr - 1 - nstart);
+                    } else {
+                        // Unescape into stack buffer
+                        const char* cur = nstart;
+                        uint16_t ulen = 0;
+                        while (cur < ptr - 1) {
+                            if (*cur == '"' && *(cur + 1) == '"') {
+                                unescaped_buf[ulen++] = '"';
+                                cur += 2;
+                            } else {
+                                unescaped_buf[ulen++] = *cur++;
+                            }
+                        }
+                        name_ptr = unescaped_buf;
+                        name_len = ulen;
                     }
+                } else {
+                    const char* nstart = ptr;
+                    while (ptr < end && *ptr != ',') ptr++;
+                    name_ptr = nstart;
+                    name_len = (uint16_t)(ptr - nstart);
                 }
                 ptr++; // skip ','
 
@@ -336,8 +371,8 @@ int main(int argc, char** argv) {
                 if (ptr < end && *ptr == '\r') ptr++;
                 if (ptr < end && *ptr == '\n') ptr++;
 
-                uint8_t cid = (reg_id < 10000000) ? REGION_TO_COUNTRY[reg_id] : 255;
-                ThreadAgg& agg = aggs[cid];
+                uint8_t cid = (reg_id < 1000000) ? REGION_TO_COUNTRY[reg_id] : 255;
+                ThreadCountryAgg& agg = aggs[cid];
                 if (!agg.has_record) {
                     agg.has_record = true;
                     agg.count = 1;
@@ -345,7 +380,7 @@ int main(int argc, char** argv) {
                     agg.amount_sum = cents;
                     agg.amount_min = cents;
                     agg.amount_max = cents;
-                    agg.name_bytes = name_bytes;
+                    agg.name_bytes = name_len;
                     agg.note_bytes = note_bytes;
                 } else {
                     agg.count++;
@@ -353,29 +388,13 @@ int main(int argc, char** argv) {
                     agg.amount_sum += cents;
                     if (cents < agg.amount_min) agg.amount_min = cents;
                     if (cents > agg.amount_max) agg.amount_max = cents;
-                    agg.name_bytes += name_bytes;
+                    agg.name_bytes += name_len;
                     agg.note_bytes += note_bytes;
                 }
 
-                // Append unescaped name into thread-local pool
-                uint32_t pool_offset = (uint32_t)agg.name_pool.size();
-                if (!name_has_escapes) {
-                    agg.name_pool.insert(agg.name_pool.end(), name_unescaped_start, name_unescaped_start + name_bytes);
-                } else {
-                    const char* cur = name_unescaped_start;
-                    for (uint32_t b = 0; b < name_bytes; ) {
-                        if (*cur == '"' && *(cur + 1) == '"') {
-                            agg.name_pool.push_back('"');
-                            cur += 2;
-                            b++;
-                        } else {
-                            agg.name_pool.push_back(*cur++);
-                            b++;
-                        }
-                    }
-                }
-                uint64_t nhash = fnv1a_64(agg.name_pool.data() + pool_offset, name_bytes);
-                agg.name_set.insert(nhash, pool_offset, (uint16_t)name_bytes, agg.name_pool.data());
+                // Insert into distinct names set
+                uint32_t nhash = fnv1a_32(name_ptr, name_len);
+                agg.name_set.insert_or_find(name_ptr, name_len, nhash, pool);
             }
         });
     }
@@ -392,128 +411,125 @@ int main(int argc, char** argv) {
         int64_t amount_sum = 0;
         int64_t amount_min = 0;
         int64_t amount_max = 0;
+        uint64_t names_distinct = 0;
         uint64_t name_bytes = 0;
         uint64_t note_bytes = 0;
         bool has_record = false;
-        NameHashSet name_set;
-        std::vector<char> name_pool;
+        std::string country_code;
     };
+
     std::vector<FinalAgg> final_aggs(256);
     for (int c = 0; c < 256; ++c) {
-        final_aggs[c].name_set.init(1024);
-    }
-
-    for (uint32_t c = 0; c < 256; ++c) {
+        final_aggs[c].country_code = (c == 255) ? "_UNMATCHED" : std::string(COUNTRIES[c].code, 3);
+        bool first = true;
         for (unsigned int t = 0; t < num_threads; ++t) {
-            const auto& src = thread_aggs[t][c];
-            if (!src.has_record) continue;
-            auto& dst = final_aggs[c];
-            if (!dst.has_record) {
-                dst.has_record = true;
-                dst.count = src.count;
-                dst.id_sum = src.id_sum;
-                dst.amount_sum = src.amount_sum;
-                dst.amount_min = src.amount_min;
-                dst.amount_max = src.amount_max;
-                dst.name_bytes = src.name_bytes;
-                dst.note_bytes = src.note_bytes;
+            const auto& tagg = tcontexts[t].aggs[c];
+            if (!tagg.has_record) continue;
+            if (first) {
+                final_aggs[c].has_record = true;
+                final_aggs[c].count = tagg.count;
+                final_aggs[c].id_sum = tagg.id_sum;
+                final_aggs[c].amount_sum = tagg.amount_sum;
+                final_aggs[c].amount_min = tagg.amount_min;
+                final_aggs[c].amount_max = tagg.amount_max;
+                final_aggs[c].name_bytes = tagg.name_bytes;
+                final_aggs[c].note_bytes = tagg.note_bytes;
+                first = false;
             } else {
-                dst.count += src.count;
-                dst.id_sum += src.id_sum;
-                dst.amount_sum += src.amount_sum;
-                if (src.amount_min < dst.amount_min) dst.amount_min = src.amount_min;
-                if (src.amount_max > dst.amount_max) dst.amount_max = src.amount_max;
-                dst.name_bytes += src.name_bytes;
-                dst.note_bytes += src.note_bytes;
+                final_aggs[c].count += tagg.count;
+                final_aggs[c].id_sum += tagg.id_sum;
+                final_aggs[c].amount_sum += tagg.amount_sum;
+                if (tagg.amount_min < final_aggs[c].amount_min) final_aggs[c].amount_min = tagg.amount_min;
+                if (tagg.amount_max > final_aggs[c].amount_max) final_aggs[c].amount_max = tagg.amount_max;
+                final_aggs[c].name_bytes += tagg.name_bytes;
+                final_aggs[c].note_bytes += tagg.note_bytes;
             }
+        }
+    }
 
-            // Merge names
-            for (const auto& slot : src.name_set.slots) {
+    // Merge distinct names per country
+    for (int c = 0; c < 256; ++c) {
+        if (!final_aggs[c].has_record) continue;
+
+        NameHashSet merged_set;
+        merged_set.init(1024);
+        std::vector<char> merged_pool;
+        merged_pool.reserve(16384);
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            const auto& nset = tcontexts[t].aggs[c].name_set;
+            const auto& tpool = tcontexts[t].pool;
+            for (const auto& slot : nset.slots) {
                 if (slot.hash != 0) {
-                    uint32_t new_off = (uint32_t)dst.name_pool.size();
-                    dst.name_pool.insert(dst.name_pool.end(),
-                                         src.name_pool.data() + slot.offset,
-                                         src.name_pool.data() + slot.offset + slot.len);
-                    dst.name_set.insert(slot.hash, new_off, slot.len, dst.name_pool.data());
+                    const char* s_ptr = tpool.data() + slot.offset;
+                    merged_set.insert_or_find(s_ptr, slot.len, slot.hash, merged_pool);
                 }
             }
         }
+        final_aggs[c].names_distinct = merged_set.count;
     }
 
-    // 3. Format output
-    std::vector<std::string> active_keys;
-    for (uint32_t i = 0; i < NUM_COUNTRIES; ++i) {
-        if (final_aggs[i].has_record) {
-            active_keys.push_back(std::string(COUNTRIES[i].code, 3));
+    // Filter active and sort
+    std::vector<FinalAgg> active;
+    for (int c = 0; c < 256; ++c) {
+        if (final_aggs[c].has_record) {
+            active.push_back(final_aggs[c]);
         }
     }
-    std::sort(active_keys.begin(), active_keys.end());
-    if (final_aggs[255].has_record) {
-        active_keys.push_back("_UNMATCHED");
-    }
 
-    mkdir(out_dir.c_str(), 0777);
-    std::string out_path = out_dir + "/aggregates.txt";
-    int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
-    if (out_fd < 0) return 1;
+    std::sort(active.begin(), active.end(), [](const FinalAgg& a, const FinalAgg& b) {
+        return a.country_code < b.country_code;
+    });
 
+    // Format output buffer
     std::string out_buf;
-    out_buf.reserve(64 * 1024);
-    char line_buf[512];
+    out_buf.reserve(65536);
+    char num_tmp[64];
 
-    for (const auto& key : active_keys) {
-        uint8_t cid = 255;
-        if (key != "_UNMATCHED") {
-            for (uint32_t i = 0; i < NUM_COUNTRIES; ++i) {
-                if (COUNTRIES[i].code[0] == key[0] &&
-                    COUNTRIES[i].code[1] == key[1] &&
-                    COUNTRIES[i].code[2] == key[2]) {
-                    cid = (uint8_t)i;
-                    break;
-                }
-            }
-        }
-        const auto& agg = final_aggs[cid];
+    for (const auto& row : active) {
+        out_buf.append(row.country_code);
+        out_buf.push_back(' ');
 
-        char* p = line_buf;
-        std::memcpy(p, key.data(), key.size());
-        p += key.size();
-        *p++ = ' ';
+        char* p = u64_to_str(num_tmp, row.count);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = u64_to_str(p, agg.count);
-        *p++ = ' ';
+        p = u64_to_str(num_tmp, row.id_sum);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = u64_to_str(p, (uint64_t)agg.id_sum);
-        *p++ = ' ';
+        p = format_cents(num_tmp, row.amount_sum);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = format_cents(p, agg.amount_sum);
-        *p++ = ' ';
+        p = format_cents(num_tmp, row.amount_min);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = format_cents(p, agg.amount_min);
-        *p++ = ' ';
+        p = format_cents(num_tmp, row.amount_max);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = format_cents(p, agg.amount_max);
-        *p++ = ' ';
+        p = u64_to_str(num_tmp, row.names_distinct);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = u64_to_str(p, agg.name_set.count);
-        *p++ = ' ';
+        p = u64_to_str(num_tmp, row.name_bytes);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back(' ');
 
-        p = u64_to_str(p, agg.name_bytes);
-        *p++ = ' ';
-
-        p = u64_to_str(p, agg.note_bytes);
-        *p++ = '\n';
-
-        out_buf.append(line_buf, p - line_buf);
+        p = u64_to_str(num_tmp, row.note_bytes);
+        out_buf.append(num_tmp, p - num_tmp);
+        out_buf.push_back('\n');
     }
 
-    size_t written = 0;
-    while (written < out_buf.size()) {
-        ssize_t ret = write(out_fd, out_buf.data() + written, out_buf.size() - written);
-        if (ret <= 0) break;
-        written += ret;
+    std::string out_path = out_dir + "/aggregates.txt";
+    mkdir(out_dir.c_str(), 0777);
+    int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (out_fd >= 0) {
+        write(out_fd, out_buf.data(), out_buf.size());
+        close(out_fd);
     }
-    close(out_fd);
 
     return 0;
 }
