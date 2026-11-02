@@ -142,7 +142,7 @@ template<typename F>
 static void run_workers(unsigned int num_threads, const F& fn) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 65536); // 64 KB stack per thread
+    pthread_attr_setstacksize(&attr, 65536);
 
     struct ThreadContext {
         unsigned int id;
@@ -195,8 +195,8 @@ struct GlobalEpTable {
         uint32_t slot = (uint32_t)h & HASH_MASK;
         while (true) {
             uint64_t entry_h = slots[slot].hash;
-            if (entry_h == h) return slots[slot].intern_id;
-            if (entry_h == 0) {
+            if (__builtin_expect(entry_h == h, 1)) return slots[slot].intern_id;
+            if (__builtin_expect(entry_h == 0, 0)) {
                 static std::mutex insert_mutex;
                 std::lock_guard<std::mutex> lock(insert_mutex);
                 if (slots[slot].hash == h) return slots[slot].intern_id;
@@ -236,9 +236,6 @@ struct GroupSummary {
 };
 
 static GlobalEpTable ep_table;
-static std::atomic<uint32_t> counts[TOTAL_GROUPS_CAP];
-static std::atomic<uint16_t> errors[TOTAL_GROUPS_CAP];
-static std::atomic<uint32_t> write_pos[TOTAL_GROUPS_CAP];
 static uint32_t group_offsets[TOTAL_GROUPS_CAP + 1];
 static uint16_t total_errs[TOTAL_GROUPS_CAP];
 static uint32_t active_groups[TOTAL_GROUPS_CAP];
@@ -286,21 +283,33 @@ int main(int argc, char** argv) {
     g_ep_storage_offset.store(0, std::memory_order_relaxed);
     ep_table.count.store(0, std::memory_order_relaxed);
 
-    for (size_t i = 0; i < TOTAL_GROUPS_CAP; ++i) {
-        counts[i].store(0, std::memory_order_relaxed);
-        errors[i].store(0, std::memory_order_relaxed);
+    size_t tc_bytes = num_threads * TOTAL_GROUPS_CAP * sizeof(uint32_t);
+    size_t te_bytes = num_threads * TOTAL_GROUPS_CAP * sizeof(uint16_t);
+    uint32_t* thread_counts = (uint32_t*)mmap(nullptr, tc_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint16_t* thread_errors = (uint16_t*)mmap(nullptr, te_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    uint8_t thread_min_h[16];
+    uint8_t thread_max_h[16];
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        thread_min_h[t] = 72;
+        thread_max_h[t] = 0;
     }
 
-    // PASS 1: Count frequencies and discover endpoints, skipping latency completely
+    // PASS 1: Zero-atomic thread-local counting
     run_workers(num_threads, [&](unsigned int t) {
         const char* ptr = data + chunk_starts[t];
         const char* end = data + chunk_starts[t + 1];
         const char* file_end = data + file_size;
+        uint32_t* my_counts = thread_counts + t * TOTAL_GROUPS_CAP;
+        uint16_t* my_errors = thread_errors + t * TOTAL_GROUPS_CAP;
+        uint8_t min_h = 72, max_h = 0;
 
         while (ptr < end) {
             uint8_t hr = decode_hour(ptr);
+            if (hr < min_h) min_h = hr;
+            if (hr > max_h) max_h = hr;
 
-            // Branchless SWAR method find (method starts at ptr + 28)
+            // Branchless SWAR method find
             uint64_t w;
             std::memcpy(&w, ptr + 31, 8);
             uint64_t mx = w ^ 0x2020202020202020ULL;
@@ -313,10 +322,10 @@ int main(int argc, char** argv) {
 
             bool is_err = (ep_end[1] == '5');
             uint32_t gid = (uint32_t)hr * 2048 + intern_id;
-            counts[gid].fetch_add(1, std::memory_order_relaxed);
-            if (is_err) errors[gid].fetch_add(1, std::memory_order_relaxed);
+            my_counts[gid]++;
+            if (is_err) my_errors[gid]++;
 
-            // Skip latency completely using SWAR newline search from status code
+            // Skip latency completely using SWAR newline search
             const char* p = ep_end + 5;
             if (__builtin_expect(p + 8 <= file_end, 1)) {
                 uint64_t v;
@@ -334,6 +343,8 @@ int main(int argc, char** argv) {
                 ptr = p + 1;
             }
         }
+        thread_min_h[t] = min_h;
+        thread_max_h[t] = max_h;
     });
 
     uint32_t num_eps = ep_table.count.load(std::memory_order_relaxed);
@@ -366,33 +377,69 @@ int main(int argc, char** argv) {
     size_t total_items = 0;
     size_t num_active = 0;
 
+    // Compact write offsets buffer: only ~600 KB total!
+    size_t thread_offset_start[16];
+    size_t total_write_offset_slots = 0;
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        thread_offset_start[t] = total_write_offset_slots;
+        if (thread_max_h[t] >= thread_min_h[t]) {
+            total_write_offset_slots += (size_t)(thread_max_h[t] - thread_min_h[t] + 1) * num_eps;
+        }
+    }
+
+    size_t two_bytes = total_write_offset_slots * sizeof(uint32_t);
+    uint32_t* write_offsets_buf = (uint32_t*)mmap(nullptr, two_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint32_t* thread_write_offsets[16];
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        thread_write_offsets[t] = write_offsets_buf + thread_offset_start[t];
+    }
+
     for (uint32_t hr = 0; hr < 72; ++hr) {
         for (uint32_t s = 0; s < num_eps; ++s) {
             uint32_t intern_id = sorted_intern_ids[s];
             uint32_t old_gid = hr * 2048 + intern_id;
             uint32_t new_gid = hr * num_eps + s;
-            uint32_t cnt = counts[old_gid].load(std::memory_order_relaxed);
-            total_errs[new_gid] = errors[old_gid].load(std::memory_order_relaxed);
 
+            uint32_t group_cnt = 0;
+            uint32_t group_err = 0;
+            for (unsigned int t = 0; t < num_threads; ++t) {
+                group_cnt += thread_counts[t * TOTAL_GROUPS_CAP + old_gid];
+                group_err += thread_errors[t * TOTAL_GROUPS_CAP + old_gid];
+            }
+            total_errs[new_gid] = (uint16_t)group_err;
             group_offsets[new_gid] = (uint32_t)total_items;
-            total_items += cnt;
-            write_pos[new_gid].store(group_offsets[new_gid], std::memory_order_relaxed);
 
-            if (cnt > 0) {
+            uint32_t cur = (uint32_t)total_items;
+            for (unsigned int t = 0; t < num_threads; ++t) {
+                if (hr >= thread_min_h[t] && hr <= thread_max_h[t]) {
+                    uint32_t local_gid = (hr - thread_min_h[t]) * num_eps + s;
+                    thread_write_offsets[t][local_gid] = cur;
+                }
+                cur += thread_counts[t * TOTAL_GROUPS_CAP + old_gid];
+            }
+
+            total_items += group_cnt;
+            if (group_cnt > 0) {
                 active_groups[num_active++] = new_gid;
             }
         }
     }
     group_offsets[num_groups] = (uint32_t)total_items;
 
+    // Immediately unmap thread_counts and thread_errors BEFORE allocating all_latencies!
+    munmap(thread_counts, tc_bytes);
+    munmap(thread_errors, te_bytes);
+
     // Allocate flat latencies array using anonymous mmap
     size_t lat_bytes = total_items * sizeof(uint32_t);
     uint32_t* all_latencies = (uint32_t*)mmap(nullptr, lat_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-    // PASS 2: Parse and stream latencies with branchless SWAR method find and 4-way unrolled writes
+    // PASS 2: Parse and stream latencies with zero atomics via compact thread_write_offsets
     run_workers(num_threads, [&](unsigned int t) {
         const char* ptr = data + chunk_starts[t];
         const char* end = data + chunk_starts[t + 1];
+        uint32_t* my_offsets = thread_write_offsets[t];
+        uint8_t my_min_h = thread_min_h[t];
 
         while (ptr < end) {
             if (ptr + 400 < end) {
@@ -411,7 +458,7 @@ int main(int argc, char** argv) {
                     const char* ep_end;
                     uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
                     uint32_t sorted_ep = ep_table.lookup_sorted(h);
-                    gids[k] = (uint32_t)hr * num_eps + sorted_ep;
+                    gids[k] = (uint32_t)(hr - my_min_h) * num_eps + sorted_ep;
 
                     ptr = ep_end + 5;
                     uint32_t lat = (uint32_t)(*ptr++ - '0');
@@ -423,10 +470,11 @@ int main(int argc, char** argv) {
                     lats[k] = lat;
                 }
 
-                uint32_t pos0 = write_pos[gids[0]].fetch_add(1, std::memory_order_relaxed);
-                uint32_t pos1 = write_pos[gids[1]].fetch_add(1, std::memory_order_relaxed);
-                uint32_t pos2 = write_pos[gids[2]].fetch_add(1, std::memory_order_relaxed);
-                uint32_t pos3 = write_pos[gids[3]].fetch_add(1, std::memory_order_relaxed);
+                // Zero atomics! Pure L1 cache local pointer increments!
+                uint32_t pos0 = my_offsets[gids[0]]++;
+                uint32_t pos1 = my_offsets[gids[1]]++;
+                uint32_t pos2 = my_offsets[gids[2]]++;
+                uint32_t pos3 = my_offsets[gids[3]]++;
 
                 all_latencies[pos0] = lats[0];
                 all_latencies[pos1] = lats[1];
@@ -444,7 +492,7 @@ int main(int argc, char** argv) {
                 const char* ep_end;
                 uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
                 uint32_t sorted_ep = ep_table.lookup_sorted(h);
-                uint32_t gid = (uint32_t)hr * num_eps + sorted_ep;
+                uint32_t gid = (uint32_t)(hr - my_min_h) * num_eps + sorted_ep;
 
                 ptr = ep_end + 5;
                 uint32_t lat = (uint32_t)(*ptr++ - '0');
@@ -454,13 +502,14 @@ int main(int argc, char** argv) {
                     lat = lat * 10 + (uint32_t)(c - '0');
                 }
 
-                uint32_t pos = write_pos[gid].fetch_add(1, std::memory_order_relaxed);
+                uint32_t pos = my_offsets[gid]++;
                 all_latencies[pos] = lat;
             }
         }
     });
 
-    // Immediately after Pass 2: release and unmap data file completely!
+    // Immediately unmap compact write offsets buffer and data file!
+    munmap(write_offsets_buf, two_bytes);
     madvise((void*)data, file_size, MADV_DONTNEED);
     munmap((void*)data, file_size);
 

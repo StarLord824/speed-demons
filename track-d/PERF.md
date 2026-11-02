@@ -137,6 +137,18 @@
   - Clean build under `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread` (zero compiler warnings).
   - Bit-for-bit exact SHA-256 match: `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
+## Step 12: Phased Graph Unmapping & Stack Buffer Chunked Output Streaming
+- **Hypothesis**: Output formatting previously created a dynamically growing `std::string out_buf` (`out_buf.reserve(num_queries * 12)`) while the 42 MB edge `pool`, 8 MB CSR index heads, and 1 MB query arrays remained mapped. On Falkenstein's tmpfs filesystem, heap pages and tmpfs output pages coexist, causing peak cgroup RSS to reach 86 MB. By unmapping `pool` (42 MB) and freeing CSR heads immediately after all search threads complete, memory drops to near-zero before output writing begins. Furthermore, streaming formatted integers through a 64 KB stack buffer eliminates heap reallocations.
+- **Implementation**:
+  - Unmapped `pool` (`munmap(pool, pool_bytes)`) and cleared `f_head`, `b_head`, `queries` before opening `/out/distances.txt`.
+  - Replaced `std::string out_buf` with fixed 64 KB `chunk_buf` stack buffer flushed directly via `write(out_fd, ...)`.
+  - Added explicit `madvise(MADV_DONTNEED)` and `close(qfd)` to query file ingestion.
+- **Measurement**:
+  - Clean build under `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread`.
+  - Bit-for-bit exact SHA-256 match: `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
+  - Projected container RSS on Falkenstein drops from 86.2 MB down to **~50 MB**, boosting memory score $S_M$.
+
+
 
 
 

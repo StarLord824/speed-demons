@@ -433,7 +433,9 @@ int main(int argc, char** argv) {
         if (qptr < qend && *qptr == '\n') qptr++;
         queries.push_back({s, t});
     }
+    madvise((void*)qdata, qsize, MADV_DONTNEED);
     munmap((void*)qdata, qsize);
+    close(qfd);
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
@@ -569,22 +571,33 @@ int main(int argc, char** argv) {
         }
     });
 
+    munmap(pool, pool_bytes);
+    f_head.clear(); f_head.shrink_to_fit();
+    b_head.clear(); b_head.shrink_to_fit();
+    queries.clear(); queries.shrink_to_fit();
+
     mkdir(out_dir.c_str(), 0777);
     std::string out_path = out_dir + "/distances.txt";
     int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (out_fd >= 0) {
+        char chunk_buf[65536];
+        size_t chunk_pos = 0;
         char num_tmp[32];
-        std::string out_buf;
-        out_buf.reserve(num_queries * 12);
         for (size_t qi = 0; qi < num_queries; ++qi) {
             char* p = i64_to_str(num_tmp, answers[qi]);
-            out_buf.append(num_tmp, p - num_tmp);
-            out_buf.push_back('\n');
+            size_t len = p - num_tmp;
+            if (chunk_pos + len + 1 > sizeof(chunk_buf)) {
+                write(out_fd, chunk_buf, chunk_pos);
+                chunk_pos = 0;
+            }
+            std::memcpy(chunk_buf + chunk_pos, num_tmp, len);
+            chunk_pos += len;
+            chunk_buf[chunk_pos++] = '\n';
         }
-        write(out_fd, out_buf.data(), out_buf.size());
+        if (chunk_pos > 0) {
+            write(out_fd, chunk_buf, chunk_pos);
+        }
         close(out_fd);
     }
-
-    munmap(pool, pool_bytes);
     return 0;
 }
