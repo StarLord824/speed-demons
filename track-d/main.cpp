@@ -72,6 +72,13 @@ struct Fast4AryHeap {
     size_t size() const { return data.size(); }
     uint64_t top() const { return data[0]; }
 
+    void shrink_if_large() {
+        if (__builtin_expect(data.capacity() > 16384, 0)) {
+            data.shrink_to_fit();
+            data.reserve(16384);
+        }
+    }
+
     void push(uint64_t val) {
         size_t idx = data.size();
         data.push_back(val);
@@ -92,13 +99,22 @@ struct Fast4AryHeap {
             size_t n = data.size();
             while (true) {
                 size_t child = (idx << 2) + 1;
-                if (child >= n) break;
-                size_t best = child;
-                if (child + 1 < n && data[child + 1] < data[best]) best = child + 1;
-                if (child + 2 < n && data[child + 2] < data[best]) best = child + 2;
-                if (child + 3 < n && data[child + 3] < data[best]) best = child + 3;
-                if (data[best] < last) { data[idx] = data[best]; idx = best; }
-                else break;
+                if (child + 3 < n) {
+                    size_t best = child;
+                    if (data[child + 1] < data[best]) best = child + 1;
+                    if (data[child + 2] < data[best]) best = child + 2;
+                    if (data[child + 3] < data[best]) best = child + 3;
+                    if (data[best] < last) { data[idx] = data[best]; idx = best; }
+                    else break;
+                } else if (child < n) {
+                    size_t best = child;
+                    if (child + 1 < n && data[child + 1] < data[best]) best = child + 1;
+                    if (child + 2 < n && data[child + 2] < data[best]) best = child + 2;
+                    if (data[best] < last) { data[idx] = data[best]; idx = best; }
+                    else break;
+                } else {
+                    break;
+                }
             }
             data[idx] = last;
         }
@@ -121,6 +137,15 @@ struct FlatMap64 {
     }
 
     void clear() {
+        if (__builtin_expect(slots.size() > 16384, 0)) {
+            slots.assign(16384, UINT64_MAX);
+            slots.shrink_to_fit();
+            mask = 16383;
+            touched.clear();
+            touched.reserve(16384);
+            count = 0;
+            return;
+        }
         for (uint32_t idx : touched) slots[idx] = UINT64_MAX;
         touched.clear();
         count = 0;
@@ -248,8 +273,11 @@ int main(int argc, char** argv) {
         const char* ptr = chunk_starts[t];
         const char* end = chunk_starts[t + 1];
         while (ptr < end) {
-            uint32_t u = parse_u32(ptr); ptr++;
-            uint32_t v = parse_u32(ptr); ptr++;
+            uint32_t u = 0;
+            while (*ptr >= '0') u = u * 10 + (*ptr++ - '0');
+            ptr++;
+            uint32_t v = 0;
+            while (*ptr >= '0') v = v * 10 + (*ptr++ - '0');
             while (*ptr != '\n') ptr++;
             ptr++;
             if (__builtin_expect(u != v, 1)) {
@@ -286,9 +314,14 @@ int main(int argc, char** argv) {
         const char* ptr = chunk_starts[t];
         const char* end = chunk_starts[t + 1];
         while (ptr < end) {
-            uint32_t u = parse_u32(ptr); ptr++;
-            uint32_t v = parse_u32(ptr); ptr++;
-            uint32_t w = parse_u32(ptr);
+            uint32_t u = 0;
+            while (*ptr >= '0') u = u * 10 + (*ptr++ - '0');
+            ptr++;
+            uint32_t v = 0;
+            while (*ptr >= '0') v = v * 10 + (*ptr++ - '0');
+            ptr++;
+            uint32_t w = 0;
+            while (*ptr >= '0') w = w * 10 + (*ptr++ - '0');
             if (ptr < end && *ptr == '\n') ptr++;
             if (__builtin_expect(u == v, 0)) continue;
 
@@ -399,6 +432,8 @@ int main(int argc, char** argv) {
             map_b.clear();
             pq_f.clear();
             pq_b.clear();
+            pq_f.shrink_if_large();
+            pq_b.shrink_if_large();
 
             map_f.update(s, 0);
             map_b.update(trg, 0);
@@ -443,6 +478,7 @@ int main(int argc, char** argv) {
                         }
                         uint64_t nd = d + w;
                         if (nd >= best_dist) continue;
+                        if (v == trg) best_dist = std::min(best_dist, nd);
                         if (map_f.update(v, nd)) {
                             pq_f.push((nd << 21) | v);
                         }
@@ -477,6 +513,7 @@ int main(int argc, char** argv) {
                         }
                         uint64_t nd = d + w;
                         if (nd >= best_dist) continue;
+                        if (v == s) best_dist = std::min(best_dist, nd);
                         if (map_b.update(v, nd)) {
                             pq_b.push((nd << 21) | v);
                         }

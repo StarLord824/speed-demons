@@ -1,7 +1,6 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <string_view>
 #include <algorithm>
 #include <mutex>
 #include <atomic>
@@ -126,6 +125,19 @@ inline uint64_t swar_hash_and_find_end(const char* s, const char*& ep_end) {
     }
 }
 
+template<typename T>
+inline void insertion_sort(T* arr, size_t n) {
+    for (size_t i = 1; i < n; ++i) {
+        T key = arr[i];
+        size_t j = i;
+        while (j > 0 && arr[j - 1] > key) {
+            arr[j] = arr[j - 1];
+            --j;
+        }
+        arr[j] = key;
+    }
+}
+
 template<typename F>
 static void run_workers(unsigned int num_threads, const F& fn) {
     pthread_attr_t attr;
@@ -209,7 +221,7 @@ struct GlobalEpTable {
     inline uint32_t lookup_sorted(uint64_t h) const {
         uint32_t slot = (uint32_t)h & HASH_MASK;
         while (true) {
-            if (slots[slot].hash == h) {
+            if (__builtin_expect(slots[slot].hash == h, 1)) {
                 return slots[slot].sorted_id;
             }
             slot = (slot + 1) & HASH_MASK;
@@ -283,52 +295,42 @@ int main(int argc, char** argv) {
     run_workers(num_threads, [&](unsigned int t) {
         const char* ptr = data + chunk_starts[t];
         const char* end = data + chunk_starts[t + 1];
+        const char* file_end = data + file_size;
 
         while (ptr < end) {
             uint8_t hr = decode_hour(ptr);
 
-            const char* ep_start;
-            if (ptr[31] == ' ') ep_start = ptr + 32;
-            else if (ptr[32] == ' ') ep_start = ptr + 33;
-            else if (ptr[35] == ' ') ep_start = ptr + 36;
-            else if (ptr[33] == ' ') ep_start = ptr + 34;
-            else if (ptr[34] == ' ') ep_start = ptr + 35;
-            else {
-                ptr += 28;
-                while (*ptr != ' ') ptr++;
-                ptr++;
-                ep_start = ptr;
-            }
+            // Branchless SWAR method find (method starts at ptr + 28)
+            uint64_t w;
+            std::memcpy(&w, ptr + 31, 8);
+            uint64_t mx = w ^ 0x2020202020202020ULL;
+            uint64_t mm = (mx - 0x0101010101010101ULL) & ~mx & 0x8080808080808080ULL;
+            const char* ep_start = (ptr + 31) + (__builtin_ctzll(mm) >> 3) + 1;
 
             const char* ep_end;
             uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
             uint32_t intern_id = ep_table.get_or_insert(ep_start, ep_end - ep_start, h);
 
-            ptr = ep_end + 1;
-            bool is_err = (ptr[0] == '5');
-
+            bool is_err = (ep_end[1] == '5');
             uint32_t gid = (uint32_t)hr * 2048 + intern_id;
             counts[gid].fetch_add(1, std::memory_order_relaxed);
-            if (is_err) {
-                errors[gid].fetch_add(1, std::memory_order_relaxed);
-            }
+            if (is_err) errors[gid].fetch_add(1, std::memory_order_relaxed);
 
             // Skip latency completely using SWAR newline search from status code
-            const char* p = ptr + 4; // latency starts at ptr + 4
-            if (__builtin_expect(p + 8 <= data + file_size, 1)) {
+            const char* p = ep_end + 5;
+            if (__builtin_expect(p + 8 <= file_end, 1)) {
                 uint64_t v;
                 std::memcpy(&v, p, 8);
                 uint64_t x = v ^ 0x0A0A0A0A0A0A0A0AULL;
                 uint64_t mask = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
                 if (mask != 0) {
-                    int off = __builtin_ctzll(mask) >> 3;
-                    ptr = p + off + 1;
+                    ptr = p + (__builtin_ctzll(mask) >> 3) + 1;
                 } else {
-                    while (*p != '\n' && p < data + file_size) p++;
+                    while (*p != '\n') p++;
                     ptr = p + 1;
                 }
             } else {
-                while (*p != '\n' && p < data + file_size) p++;
+                while (*p != '\n' && p < file_end) p++;
                 ptr = p + 1;
             }
         }
@@ -387,7 +389,7 @@ int main(int argc, char** argv) {
     size_t lat_bytes = total_items * sizeof(uint32_t);
     uint32_t* all_latencies = (uint32_t*)mmap(nullptr, lat_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-    // PASS 2: Parse and stream latencies with 4-way unrolled writing
+    // PASS 2: Parse and stream latencies with branchless SWAR method find and 4-way unrolled writes
     run_workers(num_threads, [&](unsigned int t) {
         const char* ptr = data + chunk_starts[t];
         const char* end = data + chunk_starts[t + 1];
@@ -400,18 +402,11 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 4; ++k) {
                     uint8_t hr = decode_hour(ptr);
 
-                    const char* ep_start;
-                    if (ptr[31] == ' ') ep_start = ptr + 32;
-                    else if (ptr[32] == ' ') ep_start = ptr + 33;
-                    else if (ptr[35] == ' ') ep_start = ptr + 36;
-                    else if (ptr[33] == ' ') ep_start = ptr + 34;
-                    else if (ptr[34] == ' ') ep_start = ptr + 35;
-                    else {
-                        ptr += 28;
-                        while (*ptr != ' ') ptr++;
-                        ptr++;
-                        ep_start = ptr;
-                    }
+                    uint64_t w;
+                    std::memcpy(&w, ptr + 31, 8);
+                    uint64_t mx = w ^ 0x2020202020202020ULL;
+                    uint64_t mm = (mx - 0x0101010101010101ULL) & ~mx & 0x8080808080808080ULL;
+                    const char* ep_start = (ptr + 31) + (__builtin_ctzll(mm) >> 3) + 1;
 
                     const char* ep_end;
                     uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
@@ -440,18 +435,11 @@ int main(int argc, char** argv) {
             } else {
                 uint8_t hr = decode_hour(ptr);
 
-                const char* ep_start;
-                if (ptr[31] == ' ') ep_start = ptr + 32;
-                else if (ptr[32] == ' ') ep_start = ptr + 33;
-                else if (ptr[35] == ' ') ep_start = ptr + 36;
-                else if (ptr[33] == ' ') ep_start = ptr + 34;
-                else if (ptr[34] == ' ') ep_start = ptr + 35;
-                else {
-                    ptr += 28;
-                    while (*ptr != ' ') ptr++;
-                    ptr++;
-                    ep_start = ptr;
-                }
+                uint64_t w;
+                std::memcpy(&w, ptr + 31, 8);
+                uint64_t mx = w ^ 0x2020202020202020ULL;
+                uint64_t mm = (mx - 0x0101010101010101ULL) & ~mx & 0x8080808080808080ULL;
+                const char* ep_start = (ptr + 31) + (__builtin_ctzll(mm) >> 3) + 1;
 
                 const char* ep_end;
                 uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
@@ -476,15 +464,20 @@ int main(int argc, char** argv) {
     madvise((void*)data, file_size, MADV_DONTNEED);
     munmap((void*)data, file_size);
 
-    // PHASE 4: Optimized percentiles with narrowed nth_element search space
+    // PHASE 4: Optimized percentiles with insertion sort for N<=24, std::sort for N<=64, and fused output length calculation
+    std::vector<size_t> thread_bytes(num_threads, 0);
     run_workers(num_threads, [&](unsigned int t) {
         size_t start_idx = (num_active * t) / num_threads;
         size_t end_idx = (num_active * (t + 1)) / num_threads;
+        size_t bytes = 0;
 
         for (size_t i = start_idx; i < end_idx; ++i) {
             uint32_t gid = active_groups[i];
+            uint32_t epid = gid % num_eps;
             uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
             uint32_t start_pos = group_offsets[gid];
+            uint32_t errors_val = total_errs[gid];
+            uint64_t ppm = ((uint64_t)errors_val * 1000000ULL) / count;
 
             uint32_t* slice = all_latencies + start_pos;
             size_t idx50 = (50ULL * count + 99) / 100 - 1;
@@ -492,7 +485,12 @@ int main(int argc, char** argv) {
             size_t idx99 = (99ULL * count + 99) / 100 - 1;
 
             uint32_t p50, p95, p99;
-            if (count <= 16) {
+            if (count <= 24) {
+                insertion_sort(slice, count);
+                p50 = slice[idx50];
+                p95 = slice[idx95];
+                p99 = slice[idx99];
+            } else if (count <= 64) {
                 std::sort(slice, slice + count);
                 p50 = slice[idx50];
                 p95 = slice[idx95];
@@ -517,34 +515,18 @@ int main(int argc, char** argv) {
             }
 
             summaries[i] = {p50, p95, p99};
+
+            uint32_t intern_id = sorted_intern_ids[epid];
+            auto ep_str = ep_table.ep_strings[intern_id];
+            bytes += 21 + ep_str.len + 1 + u32_len(count) + 1 + u32_len(p50) + 1 + u32_len(p95) + 1 + u32_len(p99) + 1 + u32_len(errors_val) + 1 + u32_len((uint32_t)ppm) + 1;
         }
+        thread_bytes[t] = bytes;
     });
 
     // Munmap all_latencies immediately!
     munmap(all_latencies, lat_bytes);
 
     // PHASE 5: Parallel output formatting via compact 16 KB stack buffers and pwrite
-    std::vector<size_t> thread_bytes(num_threads, 0);
-    run_workers(num_threads, [&](unsigned int t) {
-        size_t start_idx = (num_active * t) / num_threads;
-        size_t end_idx = (num_active * (t + 1)) / num_threads;
-        size_t bytes = 0;
-        for (size_t i = start_idx; i < end_idx; ++i) {
-            const auto& sum = summaries[i];
-            uint32_t gid = active_groups[i];
-            uint32_t epid = gid % num_eps;
-            uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
-            uint32_t errors_val = total_errs[gid];
-            uint64_t ppm = ((uint64_t)errors_val * 1000000ULL) / count;
-
-            uint32_t intern_id = sorted_intern_ids[epid];
-            auto ep_str = ep_table.ep_strings[intern_id];
-
-            bytes += 21 + ep_str.len + 1 + u32_len(count) + 1 + u32_len(sum.p50) + 1 + u32_len(sum.p95) + 1 + u32_len(sum.p99) + 1 + u32_len(errors_val) + 1 + u32_len((uint32_t)ppm) + 1;
-        }
-        thread_bytes[t] = bytes;
-    });
-
     mkdir(out_dir.c_str(), 0777);
     std::string out_path = out_dir + "/summary.txt";
     int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);

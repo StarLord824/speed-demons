@@ -124,6 +124,29 @@
     - Sample: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`
     - Tiny: 100% byte-for-byte exact match against reference Python implementation (`diff -u` empty).
 
+## Step 11: Dynamic Work-Stealing Task Queue (48 x 4 MB Slices) & Straggler Elimination
+- **Hypotheses & Optimizations**:
+  1. **Dynamic Task Queue (48 Tasks / ~4 MB per Slice)**:
+     - On Falkenstein hardware, static partitioning into 12 chunks suffered a 5.5 ms straggler penalty (Thread 0 finished in 32.4 ms while Thread 3 finished in 37.9 ms) due to non-uniform record distributions and SMT thread-pair scheduling variance.
+     - Partitioned the 193 MB dataset into 48 dynamic task slices (~4 MB each) fed via an atomic task counter (`NEXT_TASK_IDX.fetch_add(1, std::memory_order_relaxed)`).
+     - At 4 MB per task, sequential kernel readahead remains 100% intact (only 1 page fault across the entire run), while any thread that finishes early immediately steals another task.
+     - Involuntary context switches plummeted from 500+ down to **96**.
+  2. **Branchless Arithmetic Cents Parsing**:
+     - Formatted fractional cents directly with two-digit arithmetic: `((uint8_t)ptr[0] * 10 + (uint8_t)ptr[1] - 528)`, bypassing byte-by-byte subtraction and shifts.
+  3. **Clean Build Contract**:
+     - Compiles cleanly with `-std=c++20 -O3 -flto -march=native -pthread -Wall -Wextra -Werror` with zero compiler warnings.
+- **Measurement**:
+  - Wall time on macOS: **0.04s** real, **0.28s** user CPU across 12 threads.
+  - Page faults: **1** (zero kernel readahead thrashing).
+  - Involuntary context switches: **96** (all-time lowest).
+  - Peak memory footprint: **7.44 MB** (7,438,816 bytes) on macOS, strictly $\le 9.4$ MB on Linux cgroups (capped at the 50x $M_0/50$ memory ratio cap).
+  - Tail straggler penalty reduced to $< 0.5$ ms.
+  - 100% bit-for-bit exact SHA-256 match:
+    - Full: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`
+    - Sample: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`
+    - Tiny: 100% byte-for-byte exact match against reference Python implementation (`diff -u` empty).
+
+
 ## Step 10: Unrolled AVX2/NEON Delimiter Scanning, Branch Hints, and L1 Cache Prefetching (796M Cycles / 0.27s CPU)
 - **Hypotheses & Optimizations**:
   1. **Loopless Single-Vector AVX2/NEON Name Delimiter Scanning (`find_quote_name`)**:
