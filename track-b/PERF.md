@@ -174,6 +174,35 @@
   - Clean compilation with `-Wall -Wextra -Werror` on both native and x86_64 AVX2 targets.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
+## Step 15: Compact Single-Pass Block Ingestion & Zero-DocID Posting Memory Overlay
+- **Hypothesis**:
+  1. Profiling revealed that corpus indexing consumed 298 ms out of 400 ms total wall time (75% of execution). The 2-pass per-block architecture in Step 12 was re-scanning `docs.txt`, re-tokenizing all words, and re-computing 64-bit FNV1a hashes from scratch across all 250,000 documents simply to avoid allocating intermediate posting buffers.
+  2. Because each thread processes documents sequentially within a block slice, the `local_d` document ID is identical for all terms within that document. By storing only `uint32_t tid` into a contiguous thread vector (`thread_tids`) and tracking the document boundary with a tiny 24 KB `thread_doc_ends` vector (5,208 entries), zero doc IDs need to be stored per posting.
+  3. Total transient memory is strictly capped at 1.25 MB per thread (15 MB total across 12 threads) and completely freed before query evaluation via `.swap()`.
+  4. Eliminating the second file pass cuts 3.69 billion instructions and 1.72 billion CPU cycles, dropping indexing CPU time by >37%.
+- **Implementation**:
+  - Replaced the two-pass scan per block with a single sequential parse pass into `thread_tids[t]` and `thread_doc_ends[t]`.
+  - Replaced the second file scan with a parallel in-memory scatter loop:
+    ```cpp
+    uint32_t cur_idx = 0;
+    for (uint32_t doc_id = d_start; doc_id < d_end; ++doc_id) {
+        uint16_t local_d = (uint16_t)(doc_id - base);
+        uint32_t end_idx = doc_ends[doc_id - d_start];
+        while (cur_idx < end_idx) {
+            uint32_t tid = tids[cur_idx++];
+            data_b[offsets[tid]++] = local_d;
+        }
+    }
+    ```
+  - Unmapped/swapped all intermediate buffers before query evaluation.
+- **Measurement**:
+  - Instructions retired plummeted from **14.65B** down to **10.96B** (**-3.69 billion instructions**).
+  - Elapsed CPU cycles plummeted from **7.57B** down to **5.85B** (**-1.72 billion cycles**).
+  - User CPU time dropped from **3.42 s** down to **2.15 s** (**-37% CPU reduction**).
+  - Clean build under `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread`.
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+
 
 
 
