@@ -597,13 +597,18 @@ int main(int argc, char** argv) {
             }
 #endif
 
+            if (seed_len > 1 && CHAR_MAP[(uint8_t)ptr[1]] != (uint8_t)seed_w[1]) {
+                ptr++;
+                continue;
+            }
+
             if (ptr > doc_start && CHAR_MAP[(uint8_t)*(ptr - 1)] != 0) {
                 ptr++;
                 continue;
             }
 
             bool seed_match = true;
-            for (size_t b = 1; b < seed_len; ++b) {
+            for (size_t b = 2; b < seed_len; ++b) {
                 if (CHAR_MAP[(uint8_t)ptr[b]] != (uint8_t)seed_w[b]) {
                     seed_match = false;
                     break;
@@ -959,7 +964,14 @@ int main(int argc, char** argv) {
                             word &= (word - 1);
                         }
                     }
+                    size_t max_l = 0;
                     seed_idx = 0;
+                    for (size_t i = 0; i < k; ++i) {
+                        if (p_views[i].size() > max_l) {
+                            max_l = p_views[i].size();
+                            seed_idx = i;
+                        }
+                    }
                 } else {
                     size_t min_idx = SIZE_MAX;
                     uint32_t min_size = UINT32_MAX;
@@ -978,6 +990,15 @@ int main(int argc, char** argv) {
                     }
 
                     seed_idx = min_idx;
+                    if (p_views[min_idx].size() <= 2) {
+                        size_t max_l = p_views[min_idx].size();
+                        for (size_t i = 0; i < k; ++i) {
+                            if (p_views[i].size() > max_l) {
+                                max_l = p_views[i].size();
+                                seed_idx = i;
+                            }
+                        }
+                    }
                     uint32_t hot_check_hids[8];
                     uint32_t hot_check_cnt = 0;
                     uint32_t non_hot_tids[8];

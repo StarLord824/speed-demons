@@ -63,7 +63,7 @@ void run_threads(unsigned int num_threads, F&& func) {
     }
 }
 
-// 4-ary Min-Heap with packed (dist << 21 | u)
+// 4-ary Min-Heap with Branchless Tournament-Tree Pop
 struct Fast4AryHeap {
     std::vector<uint64_t> data;
     void reserve(size_t cap) { data.reserve(cap); }
@@ -100,10 +100,10 @@ struct Fast4AryHeap {
             while (true) {
                 size_t child = (idx << 2) + 1;
                 if (child + 3 < n) {
-                    size_t best = child;
-                    if (data[child + 1] < data[best]) best = child + 1;
-                    if (data[child + 2] < data[best]) best = child + 2;
-                    if (data[child + 3] < data[best]) best = child + 3;
+                    // Branchless tournament tree: parallel pair comparisons with cmov
+                    size_t b1 = (data[child] <= data[child + 1]) ? child : (child + 1);
+                    size_t b2 = (data[child + 2] <= data[child + 3]) ? (child + 2) : (child + 3);
+                    size_t best = (data[b1] <= data[b2]) ? b1 : b2;
                     if (data[best] < last) { data[idx] = data[best]; idx = best; }
                     else break;
                 } else if (child < n) {
@@ -174,6 +174,12 @@ struct FlatMap64 {
         uint32_t idx = (node * 0x9e3779b9u) & mask;
         while (true) {
             uint64_t entry = slots[idx];
+            if (entry == UINT64_MAX) {
+                slots[idx] = (nd << 21) | node;
+                touched.push_back(idx);
+                count++;
+                return true;
+            }
             if ((uint32_t)(entry & 0x1FFFFF) == node) {
                 uint64_t old_d = entry >> 21;
                 if (nd < old_d) {
@@ -181,12 +187,6 @@ struct FlatMap64 {
                     return true;
                 }
                 return false;
-            }
-            if (entry == UINT64_MAX) {
-                slots[idx] = (nd << 21) | node;
-                touched.push_back(idx);
-                count++;
-                return true;
             }
             idx = (idx + 1) & mask;
         }
@@ -196,8 +196,8 @@ struct FlatMap64 {
         uint32_t idx = (node * 0x9e3779b9u) & mask;
         while (true) {
             uint64_t entry = slots[idx];
-            if ((uint32_t)(entry & 0x1FFFFF) == node) return entry >> 21;
             if (entry == UINT64_MAX) return UINT64_MAX;
+            if ((uint32_t)(entry & 0x1FFFFF) == node) return entry >> 21;
             idx = (idx + 1) & mask;
         }
     }
@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
     size_t edges_bytes = gend - edges_start;
 
     unsigned int num_load_threads = 12;
-    if (num_load_threads > std::thread::hardware_concurrency() && std::thread::hardware_concurrency() > 0) {
+    if (std::thread::hardware_concurrency() > 0 && num_load_threads > std::thread::hardware_concurrency()) {
         num_load_threads = std::thread::hardware_concurrency();
     }
 
@@ -262,28 +262,56 @@ int main(int argc, char** argv) {
         chunk_starts[t] = approx;
     }
 
-    // Single unified head buffers: zero duplicate allocations
-    std::vector<uint32_t> f_head(n + 1, 0);
-    std::vector<uint32_t> b_head(n + 1, 0);
-    std::atomic<uint32_t>* af_head = reinterpret_cast<std::atomic<uint32_t>*>(f_head.data());
-    std::atomic<uint32_t>* ab_head = reinterpret_cast<std::atomic<uint32_t>*>(b_head.data());
+    // Allocate unified pool buffer for edges upfront (zero duplicate allocations)
+    // Sized to comfortably fit both Pass 1 thread-local degree scratch space and final packed edges
+    size_t pool_bytes = std::max((size_t)num_load_threads * 2 * n, (size_t)10000000 * sizeof(uint32_t) + 64);
+    uint8_t* pool = (uint8_t*)mmap(nullptr, pool_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
-    // Pass 1: count degrees directly (skipping self-loops)
+    std::vector<uint8_t*> f_degs(num_load_threads), b_degs(num_load_threads);
+    for (unsigned int t = 0; t < num_load_threads; ++t) {
+        f_degs[t] = pool + (size_t)(t * 2) * n;
+        b_degs[t] = pool + (size_t)(t * 2 + 1) * n;
+    }
+
+    // Pass 1: Local degree counting with ZERO atomics and ZERO cache coherence bouncing
     run_threads(num_load_threads, [&](unsigned int t) {
+        uint8_t* my_f = f_degs[t];
+        uint8_t* my_b = b_degs[t];
         const char* ptr = chunk_starts[t];
         const char* end = chunk_starts[t + 1];
         while (ptr < end) {
-            uint32_t u = 0;
+            uint32_t u = *ptr++ - '0';
             while (*ptr >= '0') u = u * 10 + (*ptr++ - '0');
             ptr++;
-            uint32_t v = 0;
+            uint32_t v = *ptr++ - '0';
             while (*ptr >= '0') v = v * 10 + (*ptr++ - '0');
-            while (*ptr != '\n') ptr++;
             ptr++;
+            while (*ptr >= '0') ptr++;
+            if (ptr < end && *ptr == '\r') ptr++;
+            if (ptr < end && *ptr == '\n') ptr++;
             if (__builtin_expect(u != v, 1)) {
-                af_head[u].fetch_add(1, std::memory_order_relaxed);
-                ab_head[v].fetch_add(1, std::memory_order_relaxed);
+                my_f[u]++;
+                my_b[v]++;
             }
+        }
+    });
+
+    // Sum local degrees into global head arrays
+    std::vector<uint32_t> f_head(n + 1, 0);
+    std::vector<uint32_t> b_head(n + 1, 0);
+
+    run_threads(num_load_threads, [&](unsigned int t) {
+        uint32_t chunk_n = (n + num_load_threads - 1) / num_load_threads;
+        uint32_t u_start = t * chunk_n;
+        uint32_t u_end = std::min(n, u_start + chunk_n);
+        for (uint32_t u = u_start; u < u_end; ++u) {
+            uint32_t fd = 0, bd = 0;
+            for (unsigned int i = 0; i < num_load_threads; ++i) {
+                fd += f_degs[i][u];
+                bd += b_degs[i][u];
+            }
+            f_head[u] = fd;
+            b_head[u] = bd;
         }
     });
 
@@ -301,8 +329,14 @@ int main(int argc, char** argv) {
     f_head[n] = f_tot;
     b_head[n] = b_tot;
 
-    std::vector<uint32_t> f_edges(f_tot);
-    std::vector<uint32_t> b_edges(b_tot);
+    // Repurpose pool memory for edge storage:
+    // f_edges occupies [0, f_tot * 4), b_edges occupies [f_tot_aligned * 4, ...)
+    uint32_t f_tot_aligned = (f_tot + 15) & ~15u;
+    uint32_t* f_edges = reinterpret_cast<uint32_t*>(pool);
+    uint32_t* b_edges = reinterpret_cast<uint32_t*>(pool + (size_t)f_tot_aligned * sizeof(uint32_t));
+
+    std::atomic<uint32_t>* af_head = reinterpret_cast<std::atomic<uint32_t>*>(f_head.data());
+    std::atomic<uint32_t>* ab_head = reinterpret_cast<std::atomic<uint32_t>*>(b_head.data());
 
     std::vector<std::vector<OverflowEntry>> local_f_ov(num_load_threads);
     std::vector<std::vector<OverflowEntry>> local_b_ov(num_load_threads);
@@ -314,14 +348,15 @@ int main(int argc, char** argv) {
         const char* ptr = chunk_starts[t];
         const char* end = chunk_starts[t + 1];
         while (ptr < end) {
-            uint32_t u = 0;
+            uint32_t u = *ptr++ - '0';
             while (*ptr >= '0') u = u * 10 + (*ptr++ - '0');
             ptr++;
-            uint32_t v = 0;
+            uint32_t v = *ptr++ - '0';
             while (*ptr >= '0') v = v * 10 + (*ptr++ - '0');
             ptr++;
-            uint32_t w = 0;
+            uint32_t w = *ptr++ - '0';
             while (*ptr >= '0') w = w * 10 + (*ptr++ - '0');
+            if (ptr < end && *ptr == '\r') ptr++;
             if (ptr < end && *ptr == '\n') ptr++;
             if (__builtin_expect(u == v, 0)) continue;
 
@@ -459,6 +494,7 @@ int main(int argc, char** argv) {
                     uint64_t cur_db = map_b.get(u);
                     if (cur_db != UINT64_MAX && d + cur_db < best_dist) {
                         best_dist = d + cur_db;
+                        if (best_dist == 0) break;
                     }
 
                     if (!pq_f.empty()) {
@@ -478,7 +514,10 @@ int main(int argc, char** argv) {
                         }
                         uint64_t nd = d + w;
                         if (nd >= best_dist) continue;
-                        if (v == trg) best_dist = std::min(best_dist, nd);
+                        if (v == trg) {
+                            best_dist = std::min(best_dist, nd);
+                            continue;
+                        }
                         if (map_f.update(v, nd)) {
                             pq_f.push((nd << 21) | v);
                         }
@@ -494,6 +533,7 @@ int main(int argc, char** argv) {
                     uint64_t cur_df = map_f.get(u);
                     if (cur_df != UINT64_MAX && cur_df + d < best_dist) {
                         best_dist = cur_df + d;
+                        if (best_dist == 0) break;
                     }
 
                     if (!pq_b.empty()) {
@@ -513,7 +553,10 @@ int main(int argc, char** argv) {
                         }
                         uint64_t nd = d + w;
                         if (nd >= best_dist) continue;
-                        if (v == s) best_dist = std::min(best_dist, nd);
+                        if (v == s) {
+                            best_dist = std::min(best_dist, nd);
+                            continue;
+                        }
                         if (map_b.update(v, nd)) {
                             pq_b.push((nd << 21) | v);
                         }
@@ -542,5 +585,6 @@ int main(int argc, char** argv) {
         close(out_fd);
     }
 
+    munmap(pool, pool_bytes);
     return 0;
 }

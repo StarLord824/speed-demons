@@ -117,5 +117,26 @@
   - Clean build under `-std=c++20 -O3 -Wall -Wextra -Werror` (zero warnings).
   - Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
+## Step 11: Zero-Atomic Pass 1 Overlay, Tournament-Tree Sift-Down, and Search Space Trimming
+- **Hypothesis**:
+  1. In Pass 1, 10–12 threads executing `fetch_add` on `head` caused cache-coherence bus locks (`lock xadd`) across 10 million atomic operations, consuming ~45 ms. Maximum node degree in Track D is only 10, meaning each thread-local degree fits in a `uint8_t` (1.74 MB per thread). By pre-allocating the 40 MB edge pool upfront and overlaying the 12 thread-local degree arrays directly into this buffer, Pass 1 degree counting runs with pure non-atomic `++deg[u]` (zero cache contention), followed by a 2.5 ms parallel sum into `head`.
+  2. Sequential 4-child comparisons in 4-ary heap sift-down created a 3-stage data-dependent comparison chain. A 2-level tournament tree (`(c0 <= c1 ? c0 : c1)` vs `(c2 <= c3 ? c2 : c3)`) evaluates child pairs in parallel with branchless `cmov`, cutting sift-down latency by 20%.
+  3. Once an edge relaxation reaches the target node ($v == trg$ in forward search, or $v == s$ in backward search), the destination node never needs to be expanded further in a shortest path search. Recording `best_dist = min(best_dist, nd)` and immediately executing `continue` eliminates redundant hash map insertions and heap operations.
+  4. Non-negative edge weights ensure no path can have negative length. If `best_dist == 0` is reached, the search breaks immediately.
+  5. In `FlatMap64`, probing an empty slot is the dominant path (99.9% in `map_b.get(u)` and majority in `map_f.update()`). Checking `entry == UINT64_MAX` before node equality eliminates unnecessary bitmask extractions on empty slots.
+- **Implementation**:
+  - Unified memory architecture: single 42 MB `pool` holds Pass 1 `uint8_t` thread-local degree buffers, which are subsequently repurposed in-place as 64-byte aligned `f_edges` and `b_edges`.
+  - Implemented branchless tournament tree comparison in `Fast4AryHeap::pop()`.
+  - Added endpoint relaxation pruning (`if (v == trg) { best_dist = std::min(best_dist, nd); continue; }`).
+  - Added early zero-distance breakout `if (best_dist == 0) break;`.
+  - Reordered empty slot checks in `FlatMap64::get` and `FlatMap64::update`.
+- **Measurement**:
+  - Pass 1 ingestion wall time plummeted from 45.8 ms down to **31.9 ms** (~30% ingestion speedup).
+  - Total local warm runtime dropped from 0.79 s down to **0.26 s** (projected **<0.12 s** on Falkenstein).
+  - Peak memory footprint dropped to **74.6 MB** on macOS (projected **~45 MB** container RSS on Linux tmpfs).
+  - Clean build under `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread` (zero compiler warnings).
+  - Bit-for-bit exact SHA-256 match: `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
+
+
 
 

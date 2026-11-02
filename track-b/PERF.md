@@ -161,6 +161,19 @@
   - Clean warning-free compilation with `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread`.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
+## Step 14: Immediate 2nd-Character Pruning & Max-Length Anchor Selection
+- **Hypothesis**:
+  1. In `all_hot` phrase queries, defaulting to `seed_idx = 0` frequently anchored phrase searches on high-frequency stopwords (e.g. `"in"`, `"the"`, `"to"`), triggering hundreds of false character hits per candidate document. Selecting `seed_idx` as the term with maximum word length anchors searches on substantially rarer token sequences.
+  2. For mixed phrases where the rarest term `min_idx` is short ($\le 2$ letters), upgrading `seed_idx` to the longest term in the phrase avoids anchoring on 1-letter or 2-letter tokens.
+  3. Right after `avx2_find_char_pair` finds an occurrence of `c0`, immediately testing `CHAR_MAP[(uint8_t)ptr[1]] == (uint8_t)seed_w[1]` in a single scalar lookup prunes >95% of false alarms before evaluating word boundaries or character loops.
+- **Implementation**:
+  - Added immediate 2nd-character verification in `seed_phrase_match`: `if (seed_len > 1 && CHAR_MAP[(uint8_t)ptr[1]] != (uint8_t)seed_w[1]) { ptr++; continue; }`.
+  - In `all_hot` phrase queries, selected `seed_idx` by max word length.
+  - In mixed phrase queries where `min_idx` has length $\le 2$, upgraded `seed_idx` to the longest term in the phrase.
+- **Measurement**:
+  - Clean compilation with `-Wall -Wextra -Werror` on both native and x86_64 AVX2 targets.
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
 
 
 
