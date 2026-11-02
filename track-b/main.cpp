@@ -83,6 +83,7 @@ inline bool bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
 static uint32_t WORD_BIT_SUM[65536];
 static uint8_t WORD_POPCNT[65536];
 static uint8_t CHAR_MAP[256];
+static uint64_t QUERY_TERM_FILTER[1024]; // 64K bits in L1 cache
 
 struct InitTables {
     InitTables() {
@@ -307,6 +308,9 @@ int main(int argc, char** argv) {
                     lower_buf[j] = c;
                 }
                 uint32_t tid = terms.get_or_insert(lower_buf, w_len);
+                uint64_t qh = fnv1a_64(lower_buf, w_len);
+                uint32_t q_bit = (uint32_t)qh & 0xFFFF;
+                QUERY_TERM_FILTER[q_bit >> 6] |= (1ULL << (q_bit & 63));
                 q.bq.term_ids.push_back(tid);
             }
             queries.push_back(std::move(q));
@@ -331,6 +335,9 @@ int main(int argc, char** argv) {
                     lower_buf[j] = c;
                 }
                 uint32_t tid = terms.get_or_insert(lower_buf, w_len);
+                uint64_t qh = fnv1a_64(lower_buf, w_len);
+                uint32_t q_bit = (uint32_t)qh & 0xFFFF;
+                QUERY_TERM_FILTER[q_bit >> 6] |= (1ULL << (q_bit & 63));
                 q.pq.term_ids.push_back(tid);
             }
             queries.push_back(std::move(q));
@@ -443,6 +450,9 @@ int main(int argc, char** argv) {
                         h = (h ^ lc) * 1099511628211ULL;
                         ptr++;
                     }
+
+                    uint32_t q_bit = (uint32_t)h & 0xFFFF;
+                    if ((QUERY_TERM_FILTER[q_bit >> 6] & (1ULL << (q_bit & 63))) == 0) continue;
 
                     uint32_t tid = terms.lookup(h);
                     if (tid != UINT32_MAX) {

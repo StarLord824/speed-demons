@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -118,9 +119,9 @@ constexpr size_t HASH_CAPACITY = 8192;
 constexpr size_t HASH_MASK = HASH_CAPACITY - 1;
 
 struct alignas(16) TableEntry {
-    std::atomic<uint64_t> hash{0};
-    std::atomic<uint16_t> intern_id{0xFFFF};
-    uint16_t sorted_id{0xFFFF};
+    uint64_t hash;
+    uint16_t intern_id;
+    uint16_t sorted_id;
 };
 
 struct EpString {
@@ -139,40 +140,34 @@ struct GlobalEpTable {
     uint32_t get_or_insert(const char* s, size_t len, uint64_t h) {
         uint32_t slot = (uint32_t)h & HASH_MASK;
         while (true) {
-            uint64_t entry_h = slots[slot].hash.load(std::memory_order_relaxed);
-            if (entry_h == h) {
-                while (slots[slot].intern_id.load(std::memory_order_acquire) == 0xFFFF) {}
-                return slots[slot].intern_id.load(std::memory_order_relaxed);
-            }
+            uint64_t entry_h = slots[slot].hash;
+            if (entry_h == h) return slots[slot].intern_id;
             if (entry_h == 0) {
-                uint64_t expected = 0;
-                if (slots[slot].hash.compare_exchange_strong(expected, h, std::memory_order_acq_rel)) {
-                    uint32_t new_id = count.fetch_add(1, std::memory_order_relaxed);
-                    uint32_t off = g_ep_storage_offset.fetch_add(len, std::memory_order_relaxed);
+                static std::mutex insert_mutex;
+                std::lock_guard<std::mutex> lock(insert_mutex);
+                if (slots[slot].hash == h) return slots[slot].intern_id;
+                if (slots[slot].hash == 0) {
+                    uint32_t new_id = count.load(std::memory_order_relaxed);
+                    uint32_t off = g_ep_storage_offset.load(std::memory_order_relaxed);
                     std::memcpy(g_ep_storage + off, s, len);
+                    g_ep_storage_offset.store(off + len, std::memory_order_relaxed);
+
                     ep_strings[new_id] = {off, (uint16_t)len};
+                    count.store(new_id + 1, std::memory_order_relaxed);
+                    slots[slot].intern_id = (uint16_t)new_id;
                     slots[slot].sorted_id = (uint16_t)new_id;
-                    slots[slot].intern_id.store((uint16_t)new_id, std::memory_order_release);
+                    slots[slot].hash = h;
                     return new_id;
                 }
-                if (expected == h) {
-                    while (slots[slot].intern_id.load(std::memory_order_acquire) == 0xFFFF) {}
-                    return slots[slot].intern_id.load(std::memory_order_relaxed);
-                }
             }
             slot = (slot + 1) & HASH_MASK;
         }
     }
+};
 
-    uint32_t lookup_sorted(uint64_t h) const {
-        uint32_t slot = (uint32_t)h & HASH_MASK;
-        while (true) {
-            if (slots[slot].hash.load(std::memory_order_relaxed) == h) {
-                return slots[slot].sorted_id;
-            }
-            slot = (slot + 1) & HASH_MASK;
-        }
-    }
+struct alignas(8) Item {
+    uint32_t gid;
+    uint32_t lat;
 };
 
 constexpr size_t TOTAL_GROUPS_CAP = 72 * 2048;
@@ -181,6 +176,7 @@ struct GroupSummary {
     uint32_t p50, p95, p99;
 };
 
+static uint32_t old_to_new_gid[TOTAL_GROUPS_CAP];
 static GlobalEpTable ep_table;
 static std::atomic<uint32_t> counts[TOTAL_GROUPS_CAP];
 static std::atomic<uint16_t> errors[TOTAL_GROUPS_CAP];
@@ -189,6 +185,11 @@ static uint32_t group_offsets[TOTAL_GROUPS_CAP + 1];
 static uint16_t total_errs[TOTAL_GROUPS_CAP];
 static uint32_t active_groups[TOTAL_GROUPS_CAP];
 static GroupSummary summaries[TOTAL_GROUPS_CAP];
+
+struct ThreadItems {
+    Item* items{nullptr};
+    size_t size{0};
+};
 
 int main(int argc, char** argv) {
     std::string data_dir = "/data";
@@ -231,27 +232,47 @@ int main(int argc, char** argv) {
     }
     chunk_starts[num_threads] = file_size;
 
+    std::memset(ep_table.slots, 0, sizeof(ep_table.slots));
     for (size_t i = 0; i < TOTAL_GROUPS_CAP; ++i) {
         counts[i].store(0, std::memory_order_relaxed);
         errors[i].store(0, std::memory_order_relaxed);
     }
 
+    std::vector<ThreadItems> thread_items(num_threads);
+    std::vector<size_t> thread_buf_bytes(num_threads);
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        size_t chunk_bytes = chunk_starts[t + 1] - chunk_starts[t];
+        size_t max_items = (chunk_bytes / 68) + 2048;
+        thread_buf_bytes[t] = max_items * sizeof(Item);
+        thread_items[t].items = (Item*)mmap(nullptr, thread_buf_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+
     std::vector<std::thread> workers;
 
-    // PASS 1: Count occurrences per group and discover endpoints (ZERO item allocations)
+    // PHASE 1: Single Pass parse over requests.log
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
+            Item* items = thread_items[t].items;
+            size_t n = 0;
+
             const char* ptr = data + chunk_starts[t];
             const char* end = data + chunk_starts[t + 1];
 
             while (ptr < end) {
                 uint8_t hr = decode_hour(ptr);
 
-                uint64_t m;
-                std::memcpy(&m, ptr + 28, 8);
-                uint64_t xm = m ^ 0x2020202020202020ULL;
-                uint64_t mask_m = (xm - 0x0101010101010101ULL) & ~xm & 0x8080808080808080ULL;
-                const char* ep_start = ptr + 29 + (__builtin_ctzll(mask_m) >> 3);
+                const char* ep_start;
+                if (ptr[31] == ' ') ep_start = ptr + 32;
+                else if (ptr[32] == ' ') ep_start = ptr + 33;
+                else if (ptr[35] == ' ') ep_start = ptr + 36;
+                else if (ptr[33] == ' ') ep_start = ptr + 34;
+                else if (ptr[34] == ' ') ep_start = ptr + 35;
+                else {
+                    ptr += 28;
+                    while (*ptr != ' ') ptr++;
+                    ptr++;
+                    ep_start = ptr;
+                }
 
                 const char* ep_end;
                 uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
@@ -266,24 +287,25 @@ int main(int argc, char** argv) {
                     errors[gid].fetch_add(1, std::memory_order_relaxed);
                 }
 
-                uint64_t lv;
-                std::memcpy(&lv, ep_end + 5, 8);
-                uint64_t xlv = lv ^ 0x0A0A0A0A0A0A0A0AULL;
-                uint64_t mask_l = (xlv - 0x0101010101010101ULL) & ~xlv & 0x8080808080808080ULL;
-                if (__builtin_expect(mask_l != 0, 1)) {
-                    ptr = (ep_end + 6) + (__builtin_ctzll(mask_l) >> 3);
-                } else {
-                    ptr = ep_end + 13;
-                    while (*ptr != '\n') ptr++;
-                    ptr++;
+                ptr = ep_end + 5;
+                uint32_t lat = *ptr++ - '0';
+                while (*ptr != '\n') {
+                    lat = lat * 10 + (*ptr++ - '0');
                 }
+                ptr++;
+
+                items[n++] = {gid, lat};
             }
+            thread_items[t].size = n;
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // INTERMEDIATE: Sort endpoints & compute exact prefix offsets
+    // Drop the entire 238MB file from cache immediately!
+    munmap((void*)data, file_size);
+
+    // PHASE 2: Sort endpoints & compute prefix sums
     uint32_t num_eps = ep_table.count.load(std::memory_order_relaxed);
 
     std::vector<uint32_t> sorted_intern_ids(num_eps);
@@ -299,16 +321,6 @@ int main(int argc, char** argv) {
         return ea.len < eb.len;
     });
 
-    std::vector<uint16_t> intern_to_sorted(num_eps);
-    for (uint32_t s = 0; s < num_eps; ++s) {
-        intern_to_sorted[sorted_intern_ids[s]] = (uint16_t)s;
-    }
-    for (size_t s = 0; s < HASH_CAPACITY; ++s) {
-        if (ep_table.slots[s].hash.load(std::memory_order_relaxed) != 0) {
-            ep_table.slots[s].sorted_id = intern_to_sorted[ep_table.slots[s].intern_id.load(std::memory_order_relaxed)];
-        }
-    }
-
     uint32_t num_groups = 72 * num_eps;
     size_t total_items = 0;
     size_t num_active = 0;
@@ -318,6 +330,7 @@ int main(int argc, char** argv) {
             uint32_t intern_id = sorted_intern_ids[s];
             uint32_t old_gid = hr * 2048 + intern_id;
             uint32_t new_gid = hr * num_eps + s;
+            old_to_new_gid[old_gid] = new_gid;
             uint32_t cnt = counts[old_gid].load(std::memory_order_relaxed);
             total_errs[new_gid] = errors[old_gid].load(std::memory_order_relaxed);
 
@@ -332,49 +345,28 @@ int main(int argc, char** argv) {
     }
     group_offsets[num_groups] = (uint32_t)total_items;
 
-    // Allocate flat latencies array (strictly 12.4 MB)
+    // Allocate flat latencies array
     size_t lat_bytes = total_items * sizeof(uint32_t);
     uint32_t* all_latencies = (uint32_t*)mmap(nullptr, lat_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-    // PASS 2: Re-scan file and stream latencies directly into all_latencies
+    // PHASE 3: Fast scatter from L2 cache buffers directly into all_latencies
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
-            const char* ptr = data + chunk_starts[t];
-            const char* end = data + chunk_starts[t + 1];
-
-            while (ptr < end) {
-                uint8_t hr = decode_hour(ptr);
-
-                uint64_t m;
-                std::memcpy(&m, ptr + 28, 8);
-                uint64_t xm = m ^ 0x2020202020202020ULL;
-                uint64_t mask_m = (xm - 0x0101010101010101ULL) & ~xm & 0x8080808080808080ULL;
-                const char* ep_start = ptr + 29 + (__builtin_ctzll(mask_m) >> 3);
-
-                const char* ep_end;
-                uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
-                uint32_t sorted_ep = ep_table.lookup_sorted(h);
-                uint32_t gid = (uint32_t)hr * num_eps + sorted_ep;
-
-                ptr = ep_end + 5;
-                uint32_t lat = *ptr++ - '0';
-                while (*ptr != '\n') {
-                    lat = lat * 10 + (*ptr++ - '0');
-                }
-                ptr++;
-
-                uint32_t pos = write_pos[gid].fetch_add(1, std::memory_order_relaxed);
-                all_latencies[pos] = lat;
+            const Item* items = thread_items[t].items;
+            size_t n = thread_items[t].size;
+            for (size_t i = 0; i < n; ++i) {
+                uint32_t new_gid = old_to_new_gid[items[i].gid];
+                uint32_t pos = write_pos[new_gid].fetch_add(1, std::memory_order_relaxed);
+                all_latencies[pos] = items[i].lat;
             }
+            // Free thread buffer immediately!
+            munmap(thread_items[t].items, thread_buf_bytes[t]);
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // Munmap requests.log file cache immediately after Pass 2!
-    munmap((void*)data, file_size);
-
-    // PHASE 3: Compute percentiles in-place via specialized sorting
+    // PHASE 4: Percentiles via specialized small-sort & nth_element
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             size_t start_idx = (num_active * t) / num_threads;
@@ -426,10 +418,10 @@ int main(int argc, char** argv) {
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // Munmap all_latencies (12.4 MB) immediately after percentiles!
+    // Munmap all_latencies immediately!
     munmap(all_latencies, lat_bytes);
 
-    // PHASE 4: Parallel output formatting into bounded buffers
+    // PHASE 5: Parallel output formatting
     struct ThreadOut {
         char* buf{nullptr};
         size_t cap{0};
@@ -443,7 +435,7 @@ int main(int argc, char** argv) {
             size_t end_idx = (num_active * (t + 1)) / num_threads;
 
             ThreadOut& tout = thread_output[t];
-            tout.cap = (end_idx - start_idx) * 96;
+            tout.cap = (end_idx - start_idx) * 110;
             tout.buf = (char*)mmap(nullptr, tout.cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             char* dst = tout.buf;
 
