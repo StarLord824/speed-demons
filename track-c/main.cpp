@@ -80,32 +80,6 @@ inline bool is_record_start(const char* ptr, const char* end) {
     return (ptr < end && *ptr == ',');
 }
 
-inline const char* find_quote_swar(const char* ptr) {
-    while (true) {
-        uint64_t v;
-        std::memcpy(&v, ptr, 8);
-        uint64_t x = v ^ 0x2222222222222222ULL;
-        uint64_t mask = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
-        if (mask != 0) {
-            return ptr + (std::countr_zero(mask) >> 3);
-        }
-        ptr += 8;
-    }
-}
-
-inline const char* find_comma_swar(const char* ptr) {
-    while (true) {
-        uint64_t v;
-        std::memcpy(&v, ptr, 8);
-        uint64_t x = v ^ 0x2C2C2C2C2C2C2C2CULL;
-        uint64_t mask = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
-        if (mask != 0) {
-            return ptr + (std::countr_zero(mask) >> 3);
-        }
-        ptr += 8;
-    }
-}
-
 int main(int argc, char** argv) {
     std::string data_dir = "/data";
     std::string out_dir = "/out";
@@ -218,22 +192,11 @@ int main(int argc, char** argv) {
     std::vector<ThreadContext> tcontexts(num_threads);
     std::vector<std::thread> workers;
 
-    const uint32_t CACHE_SIZE = 2048;
-    const uint32_t CACHE_MASK = CACHE_SIZE - 1;
-
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             const char* ptr = chunk_starts[t];
             const char* end = chunk_starts[t + 1];
             auto& aggs = tcontexts[t].aggs;
-
-            struct CacheEntry {
-                uint64_t hash;
-                uint32_t slot;
-                uint16_t cid;
-            };
-            CacheEntry local_cache[CACHE_SIZE];
-            std::memset(local_cache, 0xFF, sizeof(local_cache));
 
             while (ptr < end) {
                 if (__builtin_expect((uint8_t)*ptr == 0xEF, 0)) {
@@ -290,40 +253,27 @@ int main(int argc, char** argv) {
                     ptr++; // skip ','
                 }
 
-                // 3. note: fast SWAR scanning
+                // 3. note: fast scanning
                 uint32_t note_bytes = 0;
                 if (*ptr == '"') {
                     ptr++;
-                    const char* start = ptr;
-                    const char* q = find_quote_swar(ptr);
-                    ptr = q;
-                    if (__builtin_expect(*(ptr + 1) == ',', 1)) {
-                        note_bytes = (uint32_t)(ptr - start);
-                        ptr += 2;
-                    } else {
-                        note_bytes = (uint32_t)(ptr - start);
-                        while (true) {
-                            if (*ptr == '"') {
-                                if (*(ptr + 1) == '"') {
-                                    note_bytes++;
-                                    ptr += 2;
-                                } else {
-                                    ptr++;
-                                    break;
-                                }
-                            } else {
-                                note_bytes++;
-                                ptr++;
-                            }
+                    while (true) {
+                        const char* q = (const char*)std::memchr(ptr, '"', end - ptr);
+                        note_bytes += (uint32_t)(q - ptr);
+                        if (*(q + 1) == '"') {
+                            note_bytes++;
+                            ptr = q + 2;
+                        } else {
+                            ptr = q + 1;
+                            break;
                         }
-                        ptr++;
                     }
                 } else {
-                    const char* start = ptr;
-                    const char* c = find_comma_swar(ptr);
-                    note_bytes = (uint32_t)(c - start);
-                    ptr = c + 1;
+                    const char* c = (const char*)std::memchr(ptr, ',', end - ptr);
+                    note_bytes = (uint32_t)(c - ptr);
+                    ptr = c;
                 }
+                ptr++; // skip ','
 
                 // 4. region_id
                 uint32_t reg_id = *ptr++ - '0';
@@ -357,33 +307,21 @@ int main(int argc, char** argv) {
                 agg.name_bytes += name_len;
                 agg.note_bytes += note_bytes;
 
-                // Thread-local Cache Lookup
+                // Double hashing
                 if (nhash == 0) nhash = 1;
-                uint32_t c_idx = (uint32_t)nhash & CACHE_MASK;
-                uint32_t slot;
-                if (local_cache[c_idx].hash == nhash) {
-                    slot = local_cache[c_idx].slot;
-                    if (local_cache[c_idx].cid == cid) {
-                        // Already marked for this country in this thread!
-                        continue;
-                    }
-                    local_cache[c_idx].cid = cid;
-                } else {
-                    slot = (uint32_t)nhash & TABLE_MASK;
-                    uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
-                    while (true) {
-                        uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
-                        if (__builtin_expect(val == nhash, 1)) break;
-                        if (val == 0) {
-                            uint64_t expected = 0;
-                            if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
-                                break;
-                            }
-                            if (expected == nhash) break;
+                uint32_t slot = (uint32_t)nhash & TABLE_MASK;
+                uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
+                while (true) {
+                    uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
+                    if (__builtin_expect(val == nhash, 1)) break;
+                    if (val == 0) {
+                        uint64_t expected = 0;
+                        if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
+                            break;
                         }
-                        slot = (slot + step) & TABLE_MASK;
+                        if (expected == nhash) break;
                     }
-                    local_cache[c_idx] = {nhash, slot, (uint16_t)cid};
+                    slot = (slot + step) & TABLE_MASK;
                 }
 
                 uint32_t word_idx = slot >> 6;
