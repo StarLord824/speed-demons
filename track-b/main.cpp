@@ -13,16 +13,22 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t n) {
-    for (size_t i = 0; i < n; i += 4)
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4)
         _mm256_storeu_si256((__m256i*)(dst + i), _mm256_and_si256(_mm256_loadu_si256((const __m256i*)(dst + i)), _mm256_loadu_si256((const __m256i*)(src + i))));
+    for (; i < n; ++i) dst[i] &= src[i];
 }
 inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t n) {
-    for (size_t i = 0; i < n; i += 4)
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4)
         _mm256_storeu_si256((__m256i*)(dst + i), _mm256_or_si256(_mm256_loadu_si256((const __m256i*)(dst + i)), _mm256_loadu_si256((const __m256i*)(src + i))));
+    for (; i < n; ++i) dst[i] |= src[i];
 }
 inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
-    for (size_t i = 0; i < n; i += 4)
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4)
         _mm256_storeu_si256((__m256i*)(dst + i), _mm256_andnot_si256(_mm256_loadu_si256((const __m256i*)(src + i)), _mm256_loadu_si256((const __m256i*)(dst + i))));
+    for (; i < n; ++i) dst[i] &= ~src[i];
 }
 #else
 inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] &= src[i]; }
