@@ -76,4 +76,22 @@
     - Sample: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`
     - Tiny: 100% byte-for-byte match against reference.
 
+## Step 8: AVX2 / 32-Byte SIMD Delimiter Scanning & Vectorized 64-bit FastHash
+- **Hypotheses & Optimizations**:
+  1. **AVX2 32-Byte Quote & Comma Scanning**:
+     - On x86-64 with AVX2 (`-march=native`), `find_quote` and `find_comma` scan 32 bytes per cycle via `_mm256_cmpeq_epi8` and `_mm256_movemask_epi8`.
+     - Since raw names and notes are almost all <32 bytes, a single vector instruction finds the closing quote for >99% of fields with zero loop overhead.
+     - Provided a clean portable 8-byte SWAR fallback for non-AVX2 targets (e.g. Apple Silicon local testing).
+  2. **Vectorized 64-bit FastHash**:
+     - Eliminated byte-by-byte FNV-1a multiplication loops (which incurred 10 serialized multiplications per name, ~33M total multiplications across 3.32M records).
+     - Replaced with direct slice hashing `fast_hash(start, len)` that loads 8-byte words via unaligned loads and mixes with 64-bit constants in 3-4 CPU cycles.
+     - Verified zero collisions across all 100,520 distinct names in the dataset.
+- **Measurement**:
+  - Instructions retired dropped to **1,192,270,024** (over **1.004 billion fewer instructions** than baseline).
+  - CPU cycles reduced to **899,808,788**.
+  - Peak memory strictly maintained at **7.76 MB** (7,766,496 bytes < 8 MB).
+  - Local wall time on macOS: **40 ms** (0.04s real, 0.31s user CPU). Projected to achieve <0.020s on Falkenstein's 6 physical P-cores.
+  - 100% bit-for-bit exact SHA-256 match: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
+
+
 

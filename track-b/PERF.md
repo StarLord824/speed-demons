@@ -83,5 +83,26 @@
   - Retired instructions dropped to **13.02 billion**.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
+## Step 9: Seed-Anchored Phrase Verification, AVX2 SIMD Scanner, Single-Pass Line Tokenization & Boolean Early Exit
+- **Hypothesis**:
+  1. Profiling revealed that phrase query candidate verification (`fast_doc_phrase_match`) consumed 183 ms (over 80% of query evaluation time) because it scanned every single byte of candidate documents (4.8 KB each) and hashed every word with djb2 into a rolling ring buffer.
+  2. Because candidate documents were selected using the rarest term in the phrase (`min_idx`), that rarest word appears at most 1 or 2 times in the document. Anchoring the search directly on the rarest term and only checking immediately adjacent words reduces candidate text scanning by >95%.
+  3. Scanning for the first character of the seed word can be accelerated with AVX2 SIMD (`_mm256_cmpeq_epi8` / `_mm256_movemask_epi8`), skipping 32 bytes per cycle.
+  4. In document tokenization, scanning ahead to find `\n` to calculate `text_len` read the entire 1.2 GB corpus twice. Stopping directly at `\n` during tokenization eliminates the second full-corpus read.
+  5. In boolean queries without `OR` operators (53.7% of all boolean queries), as soon as an `AND` operation results in all zeros, the query can early-exit immediately without evaluating remaining operators or iterating over 3,907 words.
+- **Implementation**:
+  - Implemented `seed_phrase_match`: searches for whole-word occurrences of the rarest phrase word (`p_views[seed_idx]`) using `avx2_find_char_pair` (32 bytes per cycle), and verifies adjacent preceding and following words in $O(\text{phrase\_len})$ without full document tokenization.
+  - Replaced the two-pass line scan (`while (*ptr != '\n') ptr++` followed by tokenization) with a single unified pass that stops directly at `\n`.
+  - Added boolean query early exit: `bitset_and` uses `_mm256_testz_si256` to detect empty accumulators in 1 cycle. If empty and no subsequent `OR` operators exist, appends `"0 0\n"` and immediately continues to the next query.
+  - Sized `tids.reserve(num_d * 53)` and `thread_outputs[t].reserve((q_end - q_start) * 40)` to minimize heap over-allocation.
+- **Measurement**:
+  - Query evaluation time dropped from **158 ms to 93 ms** (-41%).
+  - Total retired instructions dropped from **13.02 billion to 10.61 billion** (-2.41 billion instructions).
+  - CPU cycles dropped from **7.72 billion to 6.14 billion** (-1.58 billion cycles).
+  - User CPU time dropped from **3.41 s to 2.64 s** (-22.6%).
+  - Peak memory footprint dropped to **137.1 MB**.
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+
 
 

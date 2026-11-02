@@ -12,6 +12,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define HAS_AVX2 1
+#else
+#define HAS_AVX2 0
+#endif
+
 // regions.csv IDs are in [1..999,999]. Anything >= 1,000,000 is UNMATCHED (255).
 static uint8_t REGION_TO_COUNTRY[1000000];
 
@@ -22,8 +29,101 @@ static CountryInfo COUNTRIES[256];
 static uint32_t NUM_COUNTRIES = 0;
 static uint16_t CODE_TO_CID[26 * 26 * 26];
 
-inline uint64_t fnv1a_64_update(uint64_t h, uint8_t b) {
-    return (h ^ b) * 1099511628211ULL;
+inline uint64_t fast_hash(const char* p, size_t len) {
+    if (len <= 8) {
+        if (len >= 4) {
+            uint32_t a, b;
+            std::memcpy(&a, p, 4);
+            std::memcpy(&b, p + len - 4, 4);
+            uint64_t h = (((uint64_t)a << 32) | b) ^ (len * 0x9E3779B97F4A7C15ULL);
+            h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            return h ^ (h >> 27);
+        } else if (len > 0) {
+            uint64_t a = (uint8_t)p[0];
+            uint64_t b = (uint8_t)p[len >> 1];
+            uint64_t c = (uint8_t)p[len - 1];
+            uint64_t h = ((a << 16) | (b << 8) | c) ^ (len * 0x9E3779B97F4A7C15ULL);
+            h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            return h ^ (h >> 27);
+        }
+        return 0x9E3779B97F4A7C15ULL;
+    }
+    if (len <= 16) {
+        uint64_t a, b;
+        std::memcpy(&a, p, 8);
+        std::memcpy(&b, p + len - 8, 8);
+        uint64_t h = (a ^ 0xBF58476D1CE4E5B9ULL) * 0x94D049BB133111EBULL + (b ^ (len * 0x9E3779B97F4A7C15ULL));
+        h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        return h ^ (h >> 27);
+    }
+    // len > 16
+    uint64_t h = len * 0x9E3779B97F4A7C15ULL;
+    size_t i = 0;
+    while (i + 8 <= len) {
+        uint64_t v;
+        std::memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0xBF58476D1CE4E5B9ULL;
+        i += 8;
+    }
+    if (i < len) {
+        uint64_t v;
+        std::memcpy(&v, p + len - 8, 8);
+        h = (h ^ v) * 0xBF58476D1CE4E5B9ULL;
+    }
+    h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    return h ^ (h >> 27);
+}
+
+// Fast quote search
+inline const char* find_quote(const char* ptr) {
+#if HAS_AVX2
+    __m256i quotes = _mm256_set1_epi8('"');
+    while (true) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i*)ptr);
+        uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quotes));
+        if (mask != 0) {
+            return ptr + std::countr_zero(mask);
+        }
+        ptr += 32;
+    }
+#else
+    while (true) {
+        uint64_t v;
+        std::memcpy(&v, ptr, 8);
+        uint64_t x = v ^ 0x2222222222222222ULL;
+        uint64_t mask = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
+        if (mask != 0) {
+            return ptr + (std::countr_zero(mask) >> 3);
+        }
+        ptr += 8;
+    }
+#endif
+}
+
+// Fast comma search
+inline const char* find_comma(const char* ptr) {
+#if HAS_AVX2
+    __m256i commas = _mm256_set1_epi8(',');
+    while (true) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i*)ptr);
+        uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, commas));
+        if (mask != 0) {
+            return ptr + std::countr_zero(mask);
+        }
+        ptr += 32;
+    }
+#else
+    while (true) {
+        uint64_t v;
+        std::memcpy(&v, ptr, 8);
+        uint64_t x = v ^ 0x2C2C2C2C2C2C2C2CULL;
+        uint64_t mask = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
+        if (mask != 0) {
+            return ptr + (std::countr_zero(mask) >> 3);
+        }
+        ptr += 8;
+    }
+#endif
 }
 
 // Global lock-free 131,072 slot hash table mapping 64-bit hash -> slot index (1 MB)
@@ -192,11 +292,24 @@ int main(int argc, char** argv) {
     std::vector<ThreadContext> tcontexts(num_threads);
     std::vector<std::thread> workers;
 
+    const uint32_t CACHE_SIZE = 2048;
+    const uint32_t CACHE_MASK = CACHE_SIZE - 1;
+
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             const char* ptr = chunk_starts[t];
             const char* end = chunk_starts[t + 1];
             auto& aggs = tcontexts[t].aggs;
+
+            struct CacheEntry {
+                uint64_t hash;
+                uint32_t slot;
+                uint16_t cid;
+            };
+            CacheEntry local_cache[CACHE_SIZE];
+            std::memset(local_cache, 0xFF, sizeof(local_cache));
+
+            char unescape_buf[64];
 
             while (ptr < end) {
                 if (__builtin_expect((uint8_t)*ptr == 0xEF, 0)) {
@@ -213,67 +326,80 @@ int main(int argc, char** argv) {
                 }
                 ptr++; // skip ','
 
-                // 2. name: stream fnv1a_64 directly
-                uint64_t nhash = 14695981039346656037ULL;
+                // 2. name
+                uint64_t nhash = 0;
                 uint16_t name_len = 0;
-
                 if (*ptr == '"') {
                     ptr++;
                     const char* start = ptr;
-                    while (*ptr != '"') {
-                        nhash = (nhash ^ (uint8_t)*ptr++) * 1099511628211ULL;
-                    }
+                    const char* q = find_quote(ptr);
+                    ptr = q;
                     if (__builtin_expect(*(ptr + 1) == ',', 1)) {
                         name_len = (uint16_t)(ptr - start);
+                        nhash = fast_hash(start, name_len);
                         ptr += 2; // skip '"' and ','
                     } else {
-                        name_len = (uint16_t)(ptr - start);
+                        int ulen = 0;
+                        for (const char* p = start; p < q; ++p) unescape_buf[ulen++] = *p;
                         while (true) {
                             if (*ptr == '"') {
                                 if (*(ptr + 1) == '"') {
-                                    nhash = (nhash ^ '"') * 1099511628211ULL;
-                                    name_len++;
+                                    unescape_buf[ulen++] = '"';
                                     ptr += 2;
                                 } else {
                                     ptr++; // skip closing '"'
                                     break;
                                 }
                             } else {
-                                nhash = (nhash ^ (uint8_t)*ptr++) * 1099511628211ULL;
-                                name_len++;
+                                unescape_buf[ulen++] = *ptr++;
                             }
                         }
                         ptr++; // skip ','
+                        name_len = ulen;
+                        nhash = fast_hash(unescape_buf, ulen);
                     }
                 } else {
-                    while (*ptr != ',') {
-                        nhash = (nhash ^ (uint8_t)*ptr++) * 1099511628211ULL;
-                        name_len++;
-                    }
-                    ptr++; // skip ','
+                    const char* start = ptr;
+                    const char* c = find_comma(ptr);
+                    name_len = (uint16_t)(c - start);
+                    nhash = fast_hash(start, name_len);
+                    ptr = c + 1;
                 }
 
-                // 3. note: fast scanning
+                // 3. note
                 uint32_t note_bytes = 0;
                 if (*ptr == '"') {
                     ptr++;
-                    while (true) {
-                        const char* q = (const char*)std::memchr(ptr, '"', end - ptr);
-                        note_bytes += (uint32_t)(q - ptr);
-                        if (*(q + 1) == '"') {
-                            note_bytes++;
-                            ptr = q + 2;
-                        } else {
-                            ptr = q + 1;
-                            break;
+                    const char* start = ptr;
+                    const char* q = find_quote(ptr);
+                    ptr = q;
+                    if (__builtin_expect(*(ptr + 1) == ',', 1)) {
+                        note_bytes = (uint32_t)(ptr - start);
+                        ptr += 2;
+                    } else {
+                        note_bytes = (uint32_t)(ptr - start);
+                        while (true) {
+                            if (*ptr == '"') {
+                                if (*(ptr + 1) == '"') {
+                                    note_bytes++;
+                                    ptr += 2;
+                                } else {
+                                    ptr++;
+                                    break;
+                                }
+                            } else {
+                                note_bytes++;
+                                ptr++;
+                            }
                         }
+                        ptr++;
                     }
                 } else {
-                    const char* c = (const char*)std::memchr(ptr, ',', end - ptr);
-                    note_bytes = (uint32_t)(c - ptr);
-                    ptr = c;
+                    const char* start = ptr;
+                    const char* c = find_comma(ptr);
+                    note_bytes = (uint32_t)(c - start);
+                    ptr = c + 1;
                 }
-                ptr++; // skip ','
 
                 // 4. region_id
                 uint32_t reg_id = *ptr++ - '0';
@@ -307,21 +433,32 @@ int main(int argc, char** argv) {
                 agg.name_bytes += name_len;
                 agg.note_bytes += note_bytes;
 
-                // Double hashing
+                // Thread-local Cache Lookup
                 if (nhash == 0) nhash = 1;
-                uint32_t slot = (uint32_t)nhash & TABLE_MASK;
-                uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
-                while (true) {
-                    uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
-                    if (__builtin_expect(val == nhash, 1)) break;
-                    if (val == 0) {
-                        uint64_t expected = 0;
-                        if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
-                            break;
-                        }
-                        if (expected == nhash) break;
+                uint32_t c_idx = (uint32_t)nhash & CACHE_MASK;
+                uint32_t slot;
+                if (local_cache[c_idx].hash == nhash) {
+                    slot = local_cache[c_idx].slot;
+                    if (local_cache[c_idx].cid == cid) {
+                        continue;
                     }
-                    slot = (slot + step) & TABLE_MASK;
+                    local_cache[c_idx].cid = cid;
+                } else {
+                    slot = (uint32_t)nhash & TABLE_MASK;
+                    uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
+                    while (true) {
+                        uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
+                        if (__builtin_expect(val == nhash, 1)) break;
+                        if (val == 0) {
+                            uint64_t expected = 0;
+                            if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
+                                break;
+                            }
+                            if (expected == nhash) break;
+                        }
+                        slot = (slot + step) & TABLE_MASK;
+                    }
+                    local_cache[c_idx] = {nhash, slot, (uint16_t)cid};
                 }
 
                 uint32_t word_idx = slot >> 6;

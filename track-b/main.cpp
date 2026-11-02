@@ -12,11 +12,22 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t n) {
+inline bool bitset_and(uint64_t* dst, const uint64_t* src, size_t n) {
     size_t i = 0;
-    for (; i + 4 <= n; i += 4)
-        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_and_si256(_mm256_loadu_si256((const __m256i*)(dst + i)), _mm256_loadu_si256((const __m256i*)(src + i))));
-    for (; i < n; ++i) dst[i] &= src[i];
+    __m256i acc = _mm256_setzero_si256();
+    for (; i + 4 <= n; i += 4) {
+        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + i));
+        __m256i s = _mm256_loadu_si256((const __m256i*)(src + i));
+        __m256i res = _mm256_and_si256(d, s);
+        _mm256_storeu_si256((__m256i*)(dst + i), res);
+        acc = _mm256_or_si256(acc, res);
+    }
+    uint64_t rem = 0;
+    for (; i < n; ++i) {
+        dst[i] &= src[i];
+        rem |= dst[i];
+    }
+    return _mm256_testz_si256(acc, acc) && (rem == 0);
 }
 inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t n) {
     size_t i = 0;
@@ -24,16 +35,48 @@ inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t n) {
         _mm256_storeu_si256((__m256i*)(dst + i), _mm256_or_si256(_mm256_loadu_si256((const __m256i*)(dst + i)), _mm256_loadu_si256((const __m256i*)(src + i))));
     for (; i < n; ++i) dst[i] |= src[i];
 }
-inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
+inline bool bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
     size_t i = 0;
-    for (; i + 4 <= n; i += 4)
-        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_andnot_si256(_mm256_loadu_si256((const __m256i*)(src + i)), _mm256_loadu_si256((const __m256i*)(dst + i))));
-    for (; i < n; ++i) dst[i] &= ~src[i];
+    __m256i acc = _mm256_setzero_si256();
+    for (; i + 4 <= n; i += 4) {
+        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + i));
+        __m256i s = _mm256_loadu_si256((const __m256i*)(src + i));
+        __m256i res = _mm256_andnot_si256(s, d);
+        _mm256_storeu_si256((__m256i*)(dst + i), res);
+        acc = _mm256_or_si256(acc, res);
+    }
+    uint64_t rem = 0;
+    for (; i < n; ++i) {
+        dst[i] &= ~src[i];
+        rem |= dst[i];
+    }
+    return _mm256_testz_si256(acc, acc) && (rem == 0);
+}
+inline const char* avx2_find_char_pair(const char* ptr, const char* end, uint8_t c1, uint8_t c2) {
+    __m256i v1 = _mm256_set1_epi8(c1);
+    __m256i v2 = _mm256_set1_epi8(c2);
+    while (ptr + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i*)ptr);
+        __m256i eq = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v1), _mm256_cmpeq_epi8(chunk, v2));
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
+        if (mask != 0) return ptr + __builtin_ctz(mask);
+        ptr += 32;
+    }
+    while (ptr < end && (uint8_t)*ptr != c1 && (uint8_t)*ptr != c2) ptr++;
+    return ptr;
 }
 #else
-inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] &= src[i]; }
+inline bool bitset_and(uint64_t* dst, const uint64_t* src, size_t n) {
+    uint64_t acc = 0;
+    for (size_t i = 0; i < n; ++i) { dst[i] &= src[i]; acc |= dst[i]; }
+    return acc == 0;
+}
 inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] |= src[i]; }
-inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] &= ~src[i]; }
+inline bool bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
+    uint64_t acc = 0;
+    for (size_t i = 0; i < n; ++i) { dst[i] &= ~src[i]; acc |= dst[i]; }
+    return acc == 0;
+}
 #endif
 
 // Fast lookup tables
@@ -128,7 +171,7 @@ struct TermTable {
         }
     }
 
-    uint32_t lookup(uint64_t h) const {
+    inline uint32_t lookup(uint64_t h) const {
         uint32_t idx = h & mask;
         while (true) {
             if (slots[idx].term_id == UINT32_MAX) return UINT32_MAX;
@@ -143,6 +186,7 @@ enum class BoolOp : uint8_t { AND, OR, NOT };
 struct BoolQuery {
     std::vector<uint32_t> term_ids;
     std::vector<BoolOp> ops;
+    bool has_or = false;
 };
 
 struct PhraseQuery {
@@ -205,7 +249,7 @@ int main(int argc, char** argv) {
     terms.init(100000);
 
     std::vector<Query> queries;
-    queries.reserve(32000);
+    queries.reserve(50000);
 
     // Read queries
     std::string qpath = data_dir + "/queries.txt";
@@ -243,6 +287,7 @@ int main(int argc, char** argv) {
                 }
                 if (cur + 2 <= line_end && std::memcmp(cur, "OR", 2) == 0 && (cur + 2 == line_end || cur[2] == ' ')) {
                     q.bq.ops.push_back(BoolOp::OR);
+                    q.bq.has_or = true;
                     cur += 2;
                     continue;
                 }
@@ -373,7 +418,7 @@ int main(int argc, char** argv) {
             auto& tids = thread_tids[t];
             auto& doc_start = thread_doc_start[t];
             auto& counts = thread_counts[t];
-            tids.reserve(num_d * 55);
+            tids.reserve(num_d * 53);
             doc_start.resize(num_d + 1);
 
             std::vector<uint32_t> last_seen_doc(num_terms, UINT32_MAX);
@@ -386,26 +431,17 @@ int main(int argc, char** argv) {
                 while (ptr < end && *ptr != '\t') ptr++;
                 if (ptr < end) ptr++; // skip '\t'
                 const char* text_start = ptr;
-                while (ptr < end && *ptr != '\n') ptr++;
-                uint32_t text_len = (uint32_t)(ptr - text_start);
-                if (ptr < end) ptr++; // skip '\n'
 
-                doc_text_off[doc_id] = (uint32_t)(text_start - ddata);
-                doc_text_len[doc_id] = (uint16_t)text_len;
-
-                const char* cur = text_start;
-                const char* d_end_text = text_start + text_len;
-
-                while (cur < d_end_text) {
-                    while (cur < d_end_text && CHAR_MAP[(uint8_t)*cur] == 0) cur++;
-                    if (cur >= d_end_text) break;
+                while (ptr < end && *ptr != '\n') {
+                    while (ptr < end && *ptr != '\n' && CHAR_MAP[(uint8_t)*ptr] == 0) ptr++;
+                    if (ptr >= end || *ptr == '\n') break;
 
                     uint64_t h = 14695981039346656037ULL;
-                    while (cur < d_end_text) {
-                        uint8_t lc = CHAR_MAP[(uint8_t)*cur];
+                    while (ptr < end) {
+                        uint8_t lc = CHAR_MAP[(uint8_t)*ptr];
                         if (lc == 0) break;
                         h = (h ^ lc) * 1099511628211ULL;
-                        cur++;
+                        ptr++;
                     }
 
                     uint32_t tid = terms.lookup(h);
@@ -422,6 +458,10 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+
+                doc_text_off[doc_id] = (uint32_t)(text_start - ddata);
+                doc_text_len[doc_id] = (uint16_t)(ptr - text_start);
+                if (ptr < end && *ptr == '\n') ptr++;
             }
             doc_start[num_d] = (uint32_t)tids.size();
         });
@@ -484,6 +524,108 @@ int main(int argc, char** argv) {
     workers.clear();
     std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
 
+    // Fast seed-anchored phrase verification
+    auto seed_phrase_match = [&](uint32_t doc_id, const std::string_view* p_views, size_t k, size_t seed_idx) -> bool {
+        const char* doc_start = ddata + doc_text_off[doc_id];
+        const char* doc_end = doc_start + doc_text_len[doc_id];
+        std::string_view seed_w = p_views[seed_idx];
+        size_t seed_len = seed_w.size();
+        if (doc_end - doc_start < (ptrdiff_t)seed_len) return false;
+
+        uint8_t c0 = (uint8_t)seed_w[0];
+        uint8_t c0_upper = (c0 >= 'a' && c0 <= 'z') ? (c0 - 32) : c0;
+
+        const char* ptr = doc_start;
+        const char* scan_end = doc_end - seed_len + 1;
+
+        while (ptr < scan_end) {
+#if defined(__AVX2__)
+            ptr = avx2_find_char_pair(ptr, scan_end, c0, c0_upper);
+            if (ptr >= scan_end) break;
+#else
+            uint8_t c = (uint8_t)*ptr;
+            if (c != c0 && c != c0_upper) {
+                ptr++;
+                continue;
+            }
+#endif
+
+            // Check word boundary before seed
+            if (ptr > doc_start && CHAR_MAP[(uint8_t)*(ptr - 1)] != 0) {
+                ptr++;
+                continue;
+            }
+
+            // Check seed word characters
+            bool seed_match = true;
+            for (size_t b = 1; b < seed_len; ++b) {
+                if (CHAR_MAP[(uint8_t)ptr[b]] != (uint8_t)seed_w[b]) {
+                    seed_match = false;
+                    break;
+                }
+            }
+            if (!seed_match) {
+                ptr++;
+                continue;
+            }
+
+            // Check word boundary after seed
+            if (ptr + seed_len < doc_end && CHAR_MAP[(uint8_t)*(ptr + seed_len)] != 0) {
+                ptr++;
+                continue;
+            }
+
+            // Seed matched! Now check adjacent words in order!
+            bool phrase_ok = true;
+
+            // 1. Check following words: seed_idx + 1 ... k - 1
+            const char* cur = ptr + seed_len;
+            for (size_t j = seed_idx + 1; j < k; ++j) {
+                while (cur < doc_end && CHAR_MAP[(uint8_t)*cur] == 0) cur++;
+                size_t wlen = p_views[j].size();
+                if (cur + wlen > doc_end) { phrase_ok = false; break; }
+                for (size_t b = 0; b < wlen; ++b) {
+                    if (CHAR_MAP[(uint8_t)cur[b]] != (uint8_t)p_views[j][b]) {
+                        phrase_ok = false;
+                        break;
+                    }
+                }
+                if (!phrase_ok) break;
+                cur += wlen;
+                if (cur < doc_end && CHAR_MAP[(uint8_t)*cur] != 0) { phrase_ok = false; break; }
+            }
+
+            if (!phrase_ok) {
+                ptr += seed_len;
+                continue;
+            }
+
+            // 2. Check preceding words: seed_idx - 1 down to 0
+            cur = ptr;
+            for (int j = (int)seed_idx - 1; j >= 0; --j) {
+                while (cur > doc_start && CHAR_MAP[(uint8_t)*(cur - 1)] == 0) cur--;
+                size_t wlen = p_views[j].size();
+                if (cur - wlen < doc_start) { phrase_ok = false; break; }
+                const char* w_start = cur - wlen;
+                if (w_start > doc_start && CHAR_MAP[(uint8_t)*(w_start - 1)] != 0) { phrase_ok = false; break; }
+                for (size_t b = 0; b < wlen; ++b) {
+                    if (CHAR_MAP[(uint8_t)w_start[b]] != (uint8_t)p_views[j][b]) {
+                        phrase_ok = false;
+                        break;
+                    }
+                }
+                if (!phrase_ok) break;
+                cur = w_start;
+            }
+
+            if (phrase_ok) return true;
+
+            ptr += seed_len;
+        }
+
+        return false;
+    };
+
     // Parallel query evaluation
     size_t num_queries = queries.size();
     std::vector<std::string> thread_outputs(num_threads);
@@ -493,75 +635,11 @@ int main(int argc, char** argv) {
             size_t q_start = (num_queries * t) / num_threads;
             size_t q_end = (num_queries * (t + 1)) / num_threads;
             auto& out_str = thread_outputs[t];
-            out_str.reserve((q_end - q_start) * 64);
+            out_str.reserve((q_end - q_start) * 40);
 
             std::vector<uint64_t> bitset_cur(num_words);
             std::vector<uint64_t> bitset_tmp(num_words, 0);
             char line_buf[256];
-
-            struct TokHistory {
-                uint32_t hash;
-                uint16_t len;
-                const char* ptr;
-            };
-
-            auto fast_doc_phrase_match = [&](uint32_t doc_id, const uint32_t* p_hashes, const std::string_view* p_views, size_t k) -> bool {
-                const char* ptr = ddata + doc_text_off[doc_id];
-                const char* end = ptr + doc_text_len[doc_id];
-
-                TokHistory hist[8];
-                size_t num_toks = 0;
-
-                while (ptr < end) {
-                    while (ptr < end && CHAR_MAP[(uint8_t)*ptr] == 0) ptr++;
-                    if (ptr >= end) break;
-
-                    const char* tok_start = ptr;
-                    uint32_t h = 5381;
-                    size_t tok_len = 0;
-                    while (ptr < end) {
-                        uint8_t lc = CHAR_MAP[(uint8_t)*ptr];
-                        if (lc == 0) break;
-                        h = ((h << 5) + h) + lc;
-                        tok_len++;
-                        ptr++;
-                    }
-
-                    hist[num_toks & 7] = {h, (uint16_t)tok_len, tok_start};
-                    num_toks++;
-
-                    if (num_toks >= k) {
-                        bool match = true;
-                        for (size_t j = 0; j < k; ++j) {
-                            size_t h_idx = (num_toks - k + j) & 7;
-                            if (hist[h_idx].hash != p_hashes[j] || hist[h_idx].len != p_views[j].size()) {
-                                match = false;
-                                break;
-                            }
-                        }
-                        if (match) {
-                            bool full_match = true;
-                            for (size_t j = 0; j < k; ++j) {
-                                size_t h_idx = (num_toks - k + j) & 7;
-                                const char* t_p = hist[h_idx].ptr;
-                                const char* v_p = p_views[j].data();
-                                size_t v_len = p_views[j].size();
-                                for (size_t b = 0; b < v_len; ++b) {
-                                    uint8_t tc = (uint8_t)t_p[b];
-                                    if (tc >= 'A' && tc <= 'Z') tc += 32;
-                                    if (tc != (uint8_t)v_p[b]) {
-                                        full_match = false;
-                                        break;
-                                    }
-                                }
-                                if (!full_match) break;
-                            }
-                            if (full_match) return true;
-                        }
-                    }
-                }
-                return false;
-            };
 
             for (size_t qi = q_start; qi < q_end; ++qi) {
                 const auto& q = queries[qi];
@@ -569,21 +647,60 @@ int main(int argc, char** argv) {
                     const auto& bq = q.bq;
                     uint32_t t0 = bq.term_ids[0];
                     uint32_t hid0 = hot_id[t0];
+                    bool is_cur_zero = false;
+
                     if (hid0 != UINT32_MAX) {
                         std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid0 * num_words, num_words * sizeof(uint64_t));
                     } else {
-                        std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
                         uint32_t pstart = postings_head[t0];
                         uint32_t pend = postings_head[t0 + 1];
-                        for (uint32_t i = pstart; i < pend; ++i) {
-                            uint32_t d = postings_data[i];
-                            bitset_cur[d / 64] |= (1ULL << (d % 64));
+                        if (pstart == pend) {
+                            is_cur_zero = true;
+                        } else {
+                            std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
+                            for (uint32_t i = pstart; i < pend; ++i) {
+                                uint32_t d = postings_data[i];
+                                bitset_cur[d / 64] |= (1ULL << (d % 64));
+                            }
                         }
+                    }
+
+                    if (is_cur_zero && !bq.has_or) {
+                        out_str.append("0 0\n");
+                        continue;
                     }
 
                     for (size_t op_i = 0; op_i < bq.ops.size(); ++op_i) {
                         BoolOp op = bq.ops[op_i];
                         uint32_t term_id = bq.term_ids[op_i + 1];
+
+                        if (is_cur_zero) {
+                            if (op == BoolOp::AND || op == BoolOp::NOT) {
+                                continue;
+                            } else {
+                                // 0 OR X = X
+                                uint32_t hid = hot_id[term_id];
+                                if (hid != UINT32_MAX) {
+                                    std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid * num_words, num_words * sizeof(uint64_t));
+                                    is_cur_zero = false;
+                                } else {
+                                    uint32_t pstart = postings_head[term_id];
+                                    uint32_t pend = postings_head[term_id + 1];
+                                    if (pstart == pend) {
+                                        is_cur_zero = true;
+                                    } else {
+                                        std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
+                                        for (uint32_t i = pstart; i < pend; ++i) {
+                                            uint32_t d = postings_data[i];
+                                            bitset_cur[d / 64] |= (1ULL << (d % 64));
+                                        }
+                                        is_cur_zero = false;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
                         uint32_t hid = hot_id[term_id];
                         const uint64_t* term_bits = nullptr;
                         uint32_t pstart = 0, pend = 0;
@@ -601,11 +718,11 @@ int main(int argc, char** argv) {
                         }
 
                         if (op == BoolOp::AND) {
-                            bitset_and(bitset_cur.data(), term_bits, num_words);
+                            is_cur_zero = bitset_and(bitset_cur.data(), term_bits, num_words);
                         } else if (op == BoolOp::OR) {
                             bitset_or(bitset_cur.data(), term_bits, num_words);
                         } else if (op == BoolOp::NOT) {
-                            bitset_andnot(bitset_cur.data(), term_bits, num_words);
+                            is_cur_zero = bitset_andnot(bitset_cur.data(), term_bits, num_words);
                         }
 
                         if (hid == UINT32_MAX) {
@@ -614,6 +731,19 @@ int main(int argc, char** argv) {
                                 bitset_tmp[postings_data[i] / 64] = 0;
                             }
                         }
+
+                        if (is_cur_zero) {
+                            bool has_rem_or = false;
+                            for (size_t j = op_i + 1; j < bq.ops.size(); ++j) {
+                                if (bq.ops[j] == BoolOp::OR) { has_rem_or = true; break; }
+                            }
+                            if (!has_rem_or) break;
+                        }
+                    }
+
+                    if (is_cur_zero) {
+                        out_str.append("0 0\n");
+                        continue;
                     }
 
                     // Format result with O(1) word bit sum
@@ -656,6 +786,12 @@ int main(int argc, char** argv) {
                 } else {
                     // PHRASE query
                     const auto& pq = q.pq;
+                    size_t k = pq.term_ids.size();
+                    std::string_view p_views[8];
+                    for (size_t j = 0; j < k; ++j) {
+                        p_views[j] = get_term_view(pq.term_ids[j]);
+                    }
+
                     bool all_hot = true;
                     for (uint32_t tid : pq.term_ids) {
                         if (hot_id[tid] == UINT32_MAX) {
@@ -665,6 +801,7 @@ int main(int argc, char** argv) {
                     }
 
                     std::vector<uint32_t> candidates;
+                    size_t seed_idx = 0;
 
                     if (all_hot) {
                         uint32_t hid0 = hot_id[pq.term_ids[0]];
@@ -681,6 +818,7 @@ int main(int argc, char** argv) {
                                 word &= (word - 1);
                             }
                         }
+                        seed_idx = 0;
                     } else {
                         size_t min_idx = SIZE_MAX;
                         uint32_t min_size = UINT32_MAX;
@@ -695,6 +833,7 @@ int main(int argc, char** argv) {
                             }
                         }
 
+                        seed_idx = min_idx;
                         uint32_t seed_start = postings_head[pq.term_ids[min_idx]];
                         uint32_t seed_end = postings_head[pq.term_ids[min_idx] + 1];
                         candidates.reserve(seed_end - seed_start);
@@ -725,19 +864,9 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    size_t k = pq.term_ids.size();
-                    uint32_t p_hashes[8];
-                    std::string_view p_views[8];
-                    for (size_t j = 0; j < k; ++j) {
-                        p_views[j] = get_term_view(pq.term_ids[j]);
-                        uint32_t h = 5381;
-                        for (char c : p_views[j]) h = ((h << 5) + h) + (uint8_t)c;
-                        p_hashes[j] = h;
-                    }
-
                     std::vector<uint32_t> matches;
                     for (uint32_t d : candidates) {
-                        if (fast_doc_phrase_match(d, p_hashes, p_views, k)) {
+                        if (seed_phrase_match(d, p_views, k, seed_idx)) {
                             matches.push_back(d);
                         }
                     }
