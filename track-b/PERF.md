@@ -26,34 +26,40 @@
 - **Measurement**: Reduced retired instructions by ~3.6 billion and eliminated all heap churn during phrase checking. Correctness verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
 ## Step 5: Contiguous Flat CSR Postings, Parallel Slicing & O(1) Bit-Sum Table
+- **Run ID**: `run-69c82b552ff9` (Commit `b841f87`)
 - **Hypothesis**: In Step 4, allocating 31 KB bitsets for ~6,000 terms blew peak RSS to 472 MB. Moreover, allocating 908,964 separate `std::vector<uint32_t>` objects caused extreme heap fragmentation and cache thrashing. Slicing `docs.txt` single-threaded cost 123 ms, and extracting set bits for sum computation took hundreds of iterations per word.
 - **Implementation**:
   1. Replaced all 75k `std::vector<uint32_t>` postings lists with a single flat CSR array `postings_data` (84.8 MB) and `postings_head`, constructed via a 2-pass parallel scatter with zero dynamic resizing.
   2. Restricted precomputed bitsets strictly to the top ~138 hot terms ($df \ge 1000$ and query frequency $\ge 50$), dropping bitset memory from 187 MB to 4.3 MB.
   3. Parallelized `docs.txt` line slicing across 12 threads.
   4. Implemented a 16-bit lookup table `WORD_BIT_SUM` to compute set-bit position sums in $O(1)$ instructions without looping over individual bits.
-- **Measurement**: Peak memory dropped by >350 MB down to ~100 MB. Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+- **Measurement**: Falkenstein runner scored $T = 0.5742\text{ s}$, $M = 218.97\text{ MB}$, $S = 777$, $K = 11.392$, **52.83 points**. Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
 ## Step 6: Single-Pass Document Tokenization, Direct 64-bit Hash Lookup & Rolling Ring Buffer Phrase Matcher
+- **Run ID**: `run-be77c9858252` (Commit `7b3631a`)
 - **Hypothesis**: Scanning the 253.8 MB file twice during document indexing doubled L3 cache misses. String `std::memcmp` lookups on every token in the hash table caused branch mispredictions. Re-tokenizing whole documents for phrase candidate matching spent unnecessary time when candidate phrases are only 2 to 8 tokens long.
 - **Implementation**:
   1. Implemented a 256-byte `CHAR_MAP` lookup table to categorize and lowercase ASCII bytes in 1 instruction.
   2. Transitioned to single-pass document tokenization: documents are tokenized directly into thread-local arrays with on-the-fly counting, followed by a fast memory-to-memory scatter into the flat CSR postings buffer (19.6 ms).
   3. Replaced string `std::memcmp` in `TermTable::lookup` with direct 64-bit FNV-1a hash matching (0 collisions across 75,747 terms).
   4. Replaced full document tokenization in phrase queries with an 8-entry rolling ring buffer `TokHistory hist[8]` and 32-bit djb2 hash matching, short-circuiting instantly upon candidate discovery.
-- **Measurement**: Local wall clock time dropped from 1,160 ms to 560 ms (over 2x faster). Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+- **Measurement**: Falkenstein runner scored $T = 0.5828\text{ s}$, $M = 221.10\text{ MB}$, $S = 777$, $K = 11.286$, **52.63 points**. Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
-## Step 7: SIMD AVX2/NEON Bitset Queries, Zero-Allocation Output Buffering & Parallel Bitset Precomputation
-- **Hypothesis**: Word-by-word bitset evaluation in 31,000 BOOL queries incurred high instruction overhead. Allocating 50,000 individual `std::string` objects for query outputs caused allocator churn. Candidate filtering in phrase queries repeatedly binary-searched large posting lists even for high-df terms whose bitsets could be tested in $O(1)$ time. Precomputing hot bitsets sequentially cost 20+ ms.
+## Step 7: SIMD AVX2 Bitset Queries, Zero-Allocation Output Buffering & Source Size Trimming
+- **Hypothesis**: Word-by-word bitset evaluation in 31,000 BOOL queries incurred high instruction overhead. Allocating 50,000 individual `std::string` objects for query outputs caused allocator churn. Candidate filtering in phrase queries repeatedly binary-searched large posting lists even for high-df terms whose bitsets could be tested in $O(1)$ time. 46 lines of dead `#elif defined(__ARM_NEON)` and fallback code penalized the $S$ source size metric.
 - **Implementation**:
-  1. Implemented explicit AVX2 SIMD intrinsics (`_mm256_and_si256`, `_mm256_or_si256`, `_mm256_andnot_si256`) with ARM NEON (`vandq_u64`, `vorrq_u64`, `vbicq_u64`) and portable fallbacks for bitset boolean queries.
-  2. Substituted per-query `std::string` allocations with thread-local output string buffers (`thread_outputs[t].reserve(...)`), streaming directly to `write(out_fd, ...)`.
-  3. Parallelized bitset precomputation across worker threads for terms with $(df \ge 1000 \land freq \ge 20) \lor df \ge 7800$.
-  4. In phrase queries, candidate documents are checked against precomputed bitsets via $O(1)$ bit test (`(bptr[d / 64] >> (d % 64)) & 1`), skipping binary search for common terms.
+  1. Implemented explicit AVX2 SIMD intrinsics (`_mm256_and_si256`, `_mm256_or_si256`, `_mm256_andnot_si256`) with clean 3-line inline fallback for bitset boolean queries.
+  2. Removed 52 lines of dead code and unused headers (`<iostream>`, `<chrono>`), trimming $S$ from 777 to 725 to directly boost the $(S_{\text{ref}}/S)^{0.15}$ factor.
+  3. Substituted per-query `std::string` allocations with thread-local output string buffers (`thread_outputs[t].reserve(...)`), streaming directly to `write(out_fd, ...)`.
+  4. Parallelized bitset precomputation across worker threads for terms with $(df \ge 1000 \land freq \ge 20) \lor df \ge 7800$.
+  5. In phrase queries, candidate documents are checked against precomputed bitsets via $O(1)$ bit test (`(bptr[d / 64] >> (d % 64)) & 1`), skipping binary search for common terms.
+  6. Sized `tids.reserve(num_d * 92)` to eliminate over-reservation across thread buffers.
 - **Measurement**:
   - Local wall clock time dropped to **0.40 s** (down from 1.48 s baseline, ~3.7x faster).
   - User CPU time dropped to **2.92 s** (down from 6.85 s baseline).
-  - Retired instructions dropped from **36.16 billion to 13.93 billion** (a reduction of 22.2 billion instructions, or -61.5%).
-  - Cycles elapsed dropped from **17.10 billion to 7.85 billion** (-54%).
+  - Retired instructions dropped from **36.16 billion to 13.91 billion** (-61.5% retired instructions).
+  - Cycles elapsed dropped from **17.10 billion to 7.60 billion** (-55.5% cycles).
+  - Source lines $S$ dropped from **777 to 725 lines**.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
 

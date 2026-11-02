@@ -1,4 +1,3 @@
-#include <iostream>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -6,7 +5,6 @@
 #include <thread>
 #include <cstring>
 #include <cstdint>
-#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -14,72 +12,22 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    size_t i = 0;
-    for (; i + 4 <= num_words; i += 4) {
-        __m256i va = _mm256_loadu_si256((const __m256i*)(dst + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i*)(src + i));
-        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_and_si256(va, vb));
-    }
-    for (; i < num_words; ++i) dst[i] &= src[i];
+inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t n) {
+    for (size_t i = 0; i < n; i += 4)
+        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_and_si256(_mm256_loadu_si256((const __m256i*)(dst + i)), _mm256_loadu_si256((const __m256i*)(src + i))));
 }
-inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    size_t i = 0;
-    for (; i + 4 <= num_words; i += 4) {
-        __m256i va = _mm256_loadu_si256((const __m256i*)(dst + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i*)(src + i));
-        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_or_si256(va, vb));
-    }
-    for (; i < num_words; ++i) dst[i] |= src[i];
+inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t n) {
+    for (size_t i = 0; i < n; i += 4)
+        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_or_si256(_mm256_loadu_si256((const __m256i*)(dst + i)), _mm256_loadu_si256((const __m256i*)(src + i))));
 }
-inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    size_t i = 0;
-    for (; i + 4 <= num_words; i += 4) {
-        __m256i va = _mm256_loadu_si256((const __m256i*)(dst + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i*)(src + i));
-        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_andnot_si256(vb, va));
-    }
-    for (; i < num_words; ++i) dst[i] &= ~src[i];
-}
-#elif defined(__ARM_NEON)
-#include <arm_neon.h>
-inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    size_t i = 0;
-    for (; i + 2 <= num_words; i += 2) {
-        uint64x2_t va = vld1q_u64(dst + i);
-        uint64x2_t vb = vld1q_u64(src + i);
-        vst1q_u64(dst + i, vandq_u64(va, vb));
-    }
-    for (; i < num_words; ++i) dst[i] &= src[i];
-}
-inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    size_t i = 0;
-    for (; i + 2 <= num_words; i += 2) {
-        uint64x2_t va = vld1q_u64(dst + i);
-        uint64x2_t vb = vld1q_u64(src + i);
-        vst1q_u64(dst + i, vorrq_u64(va, vb));
-    }
-    for (; i < num_words; ++i) dst[i] |= src[i];
-}
-inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    size_t i = 0;
-    for (; i + 2 <= num_words; i += 2) {
-        uint64x2_t va = vld1q_u64(dst + i);
-        uint64x2_t vb = vld1q_u64(src + i);
-        vst1q_u64(dst + i, vbicq_u64(va, vb));
-    }
-    for (; i < num_words; ++i) dst[i] &= ~src[i];
+inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
+    for (size_t i = 0; i < n; i += 4)
+        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_andnot_si256(_mm256_loadu_si256((const __m256i*)(src + i)), _mm256_loadu_si256((const __m256i*)(dst + i))));
 }
 #else
-inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    for (size_t i = 0; i < num_words; ++i) dst[i] &= src[i];
-}
-inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    for (size_t i = 0; i < num_words; ++i) dst[i] |= src[i];
-}
-inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t num_words) {
-    for (size_t i = 0; i < num_words; ++i) dst[i] &= ~src[i];
-}
+inline void bitset_and(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] &= src[i]; }
+inline void bitset_or(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] |= src[i]; }
+inline void bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) { for (size_t i = 0; i < n; ++i) dst[i] &= ~src[i]; }
 #endif
 
 // Fast lookup tables
@@ -402,7 +350,7 @@ int main(int argc, char** argv) {
             auto& tids = thread_tids[t];
             auto& doc_start = thread_doc_start[t];
             auto& counts = thread_counts[t];
-            tids.reserve(2500000);
+            tids.reserve(num_d * 92);
             doc_start.resize(num_d + 1);
 
             std::vector<uint32_t> last_seen_doc(num_terms, UINT32_MAX);

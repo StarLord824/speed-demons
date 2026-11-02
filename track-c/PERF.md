@@ -43,6 +43,9 @@
   5. **Branchless Integer Parsing & Country Aggregations**: Replaced digit loop range checks with single-byte delimiter checks (`*ptr != ','` and `*ptr != '.'`); replaced `if (!agg.has_record)` checks with branchless initialization (`INT64_MAX` / `INT64_MIN`) and branchless `std::min` / `std::max` (`cmov`).
   6. **Zero-Allocation Single-Syscall Output**: Formatted aggregates into a stack-allocated buffer and flushed with a single `write(2)` syscall.
 - **Measurement**:
+  - **Live Board Run IDs**:
+    - `run-df54aa374aa1` (commit `9930a80`): $T = 0.052712$ s, $M = 10.47$ MB, $S = 423$, $K = 27.48$, **71.952 points**.
+    - `run-846b2a9d8bfa` (commit `7b3631a`): $T = 0.051096$ s, $M = 10.22$ MB, $S = 423$, $D = 1$, $K = 27.91$, **72.393 points**.
   - Instructions retired dropped by **40.5%** from 2,196,507,998 to 1,303,609,123 (~893 million fewer instructions).
   - CPU cycles dropped from 1,280,833,570 to 945,765,241.
   - Peak memory footprint dropped from 12.5 MB to **7.4 MB** (and static BSS dropped from 11 MB to 5.04 MB).

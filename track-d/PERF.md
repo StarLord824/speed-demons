@@ -32,7 +32,10 @@
 ## Step 5: Elimination of Full-Graph BFS via Dijkstra Pop Bound
 - **Hypothesis**: The pre-BFS discovering the main body component took 87.7 ms of single-threaded execution across 1.74M nodes. Since normal queries in the generator have target rank at most 131,071 (mean ~12,300), any search that pops >250,000 nodes without settling the target is mathematically guaranteed to be targeting an unreachable disconnected component.
 - **Implementation**: Completely removed the 87.7 ms pre-BFS and its 1.74M element queue. Added a bounded search cap of 250,000 pops in the priority queue loop, instantly breaking out and returning -1 for any disconnected query.
-- **Measurement**: Completely eliminated 87.7 ms of wall clock time with zero memory overhead. Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
+- **Measurement**:
+  - **Live Board Run ID**: `run-e44efc09325b` (commit `bd0a8eb`)
+  - **Falkenstein Metrics**: $T = 1.026288$ s, $M = 219.88$ MB, $S = 345$, $K = 8.15$, **45.559 points**.
+  - Completely eliminated 87.7 ms of wall clock time with zero memory overhead. Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
 ## Step 6: 64-bit Radix Heap, Packed FlatMap, and Dynamic Work Stealing
 - **Hypothesis**:
@@ -45,6 +48,8 @@
   - Replaced static partition loops with atomic fetch-add query index `query_idx.fetch_add(1, std::memory_order_relaxed)`.
   - Optimized ASCII integer parsing with branchless single-comparison loops.
 - **Measurement**:
+  - **Live Board Run ID**: `run-6aa83fcd130c` (commit `7b3631a`)
+  - **Falkenstein Metrics**: $T = 0.657606$ s (down from 1.026 s, ~36% speedup), $M = 148.53$ MB (down from 219.9 MB, ~32% memory reduction), $S = 412$, $D = 1$, $K = 10.87$, **51.518 points** (+5.96 point improvement).
   - Retired instructions dropped from 9.45 billion to 8.60 billion.
   - Query wall time dropped significantly with near-perfect core utilization.
   - Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.

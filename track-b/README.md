@@ -30,5 +30,6 @@ None. Zero non-standard-library runtime dependencies ($D = 1.0$).
 
 ## With another 24 hours
 
-- Implement explicit AVX2 SIMD intrinsics (`_mm256_and_si256`, `_mm256_or_si256`) for bitset queries.
-- Pre-parse token offsets for phrase verification.
+- Implement bit-packed or Elias-Fano delta compression for inverted lists to reduce peak memory toward 30 MB.
+- Direct SIMD-vectorized character scanning and token boundary detection.
+
