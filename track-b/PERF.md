@@ -62,4 +62,26 @@
   - Source lines $S$ dropped from **777 to 725 lines**.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
+## Step 8: Direct-to-Bitset Materialization, 64-Doc Word Alignment, Binary Search Document Partitioning & Sparse Reset
+- **Hypothesis**:
+  1. The separate document slicing pass (`docs` vector of 250k slices) scanned the entire 1.2 GB corpus, taking 155 ms of redundant I/O before tokenization.
+  2. The top 718 terms with query frequency $\ge 15$ account for over 11.46 million postings (51.5% of ALL postings in the corpus). Storing them in intermediate arrays (`thread_tids`) and later scattering them into `postings_data` doubled memory consumption during ingestion to >220 MB.
+  3. Pre-materializing bitsets for these 718 hot terms directly during the document scan eliminates 11.46M entries from `thread_tids` and `postings_data`.
+  4. Aligning thread document partitions to multiples of 64 guarantees that each thread writes to strictly disjoint 64-bit words in all bitsets, eliminating locks, atomics, and data races.
+  5. Slicing can be eliminated completely: finding 12 document boundaries with binary search takes only 615 microseconds, allowing document offsets and lengths (`doc_text_off`, `doc_text_len`) to be recorded on the fly during tokenization.
+  6. In boolean query execution, resetting `bitset_tmp` with full 31.2 KB `std::memset` for every non-hot term across 31,000 queries forced 1.8 GB of zeroing overhead. Sparse clearing (`bitset_tmp[d / 64] = 0` for only touched words) eliminates 99.8% of zeroing instructions.
+- **Implementation**:
+  - Implemented 615-microsecond binary search `find_doc_start` to partition documents into exact multiples of 64 docs per thread.
+  - Eliminated the 250,000-element `DocSlice` vector (saved 4 MB dynamic allocation and 155 ms file scan). Recorded `doc_text_off[250000]` and `doc_text_len[250000]` in static memory (1.5 MB).
+  - Pre-allocated a contiguous `hot_bitsets` buffer (22.4 MB) for the 718 most queried terms (`query_term_freq >= 15`). During the single-pass document scan, threads populate their disjoint 64-bit words directly without atomics or locks.
+  - Omitted hot terms from `thread_tids` and `postings_data`, cutting intermediate buffer sizes and scatter iterations by 51.5% (from 22.2M to 10.78M entries).
+  - Implemented sparse resetting of `bitset_tmp` after boolean operations, clearing only the words actually modified.
+  - Intersected precomputed bitsets directly for phrase queries where all terms are hot.
+- **Measurement**:
+  - Local wall clock time dropped to **0.97 s** (internal phase execution dropped from 825 ms to **378 ms**).
+  - Peak memory footprint dropped from **223.5 MB to 139.2 MB** (-84.3 MB / -37.7% peak memory reduction).
+  - Retired instructions dropped to **13.02 billion**.
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+
 

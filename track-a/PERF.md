@@ -59,3 +59,23 @@
   - Peak resident memory footprint dropped to **~15.5 MB** on Linux / 21 MB on macOS.
   - 100% bit-for-bit exact SHA-256 match: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
+## Step 8: Single-Pass Ingest Architecture with L2 Cache Staging and Direct Remapped Scatter
+- **Hypothesis**: The two-pass architecture in Step 7 required scanning the entire 238.8 MB `requests.log` file twice from disk, incurring duplicate file traversal, duplicate byte parsing, and duplicate SWAR hashing of 3.1 million endpoint strings. By replacing the 2nd file scan with a single sequential parse pass into compact 8-byte thread-local item buffers (`Item { uint32_t gid; uint32_t lat; }`) that fit directly inside the 2.0 MB L2 core cache of the Intel Raptor Lake P-cores (~1.97 MB per thread), `requests.log` can be unmapped from memory immediately after Phase 1. Endpoints and timestamps are parsed only once. In Phase 3, latencies are scattered directly from L2 cache into the contiguous 12.4 MB `all_latencies` buffer via a precomputed dense group mapping table (`old_to_new_gid`), eliminating multi-instruction bit manipulation in the scatter loop. Thread buffers are immediately `munmap`ped as each thread completes, followed by `munmap` of `all_latencies` immediately after percentile selection.
+- **Implementation**:
+  1. **Single-Pass File Scan**: Divided into 12 thread slices parsed into thread-local anonymous `mmap` buffers. Total physical pages touched per thread is only 1.97 MB (258,000 items × 8 bytes), fitting entirely in the Raptor Lake 2.0 MB L2 core cache.
+  2. **Early File Eviction**: `requests.log` is completely unmapped immediately after Phase 1, freeing the file cache pages. Endpoint strings are copied to a compact 256 KB global buffer (`g_ep_storage`) so string pointers remain valid for sorting and formatting.
+  3. **Direct Remapping Table (`old_to_new_gid`)**: A flat 576 KB lookup table replaces the shift/mask/multiplication arithmetic inside the 3.1-million-iteration scatter loop with a single index lookup.
+  4. **Phased Lifecycle & Immediate Munmap**:
+     - Phase 1: Parse file to L2 thread buffers (23.6 MB resident). Unmap file (238.8 MB).
+     - Phase 2: Lexicographically sort 1,842 endpoints & prefix sums (~0.1 ms).
+     - Phase 3: Direct scatter from L2 buffers to `all_latencies` (12.4 MB). As each thread finishes, its buffer is `munmap`ped immediately.
+     - Phase 4: Compute percentiles in-place via specialized sorting (`count == 1, 2, 3`, `std::sort` for `count <= 16`, and `std::nth_element` for larger groups). `all_latencies` (12.4 MB) is `munmap`ped immediately after Phase 4.
+     - Phase 5: Formats output using 2-digit LUT (`DIGITS_LUT`) and writes sequentially to disk.
+- **Measurement**:
+  - **Verification**: 100% bit-for-bit exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
+  - Instructions retired dropped by an additional ~210M instructions down to **780.5M instructions** (down from 990M in Step 7 and 2.75B in the baseline).
+  - Elapsed CPU cycles down to **496M cycles** (down from 670M in Step 7 and 1.51B in baseline).
+  - Local wall clock time dropped to **~33 ms** (best 30.7 ms, down from 44.5 ms in Step 7 and 75.9 ms in Step 6).
+  - Peak resident memory during execution strictly bounded to thread buffers + flat latency array (~37 MB virtual / resident during scatter, unmapped phase-by-phase).
+
+

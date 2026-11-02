@@ -55,3 +55,25 @@
     - Sample: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`
     - Tiny: 100% byte-for-byte identical to Python reference.
 
+## Step 7: L1 Direct-Mapped Thread Caches & 8-Byte SWAR Note Scanning (<8 MB)
+- **Hypotheses & Optimizations**:
+  1. **Thread-Local L1 Cache for Hash & Country (`local_cache[2048]`)**:
+     - Previously, every record probed the global `NAME_TABLE` and loaded from the 4 MB `COUNTRY_BITS` table, causing cross-core cache invalidations and L3 cache traffic.
+     - Implemented a 2048-entry direct-mapped thread-local cache (`CacheEntry { uint64_t hash; uint32_t slot; uint16_t cid; }`), fitting completely in the 32 KB L1 data cache (32 KB per thread).
+     - When `local_cache[c_idx].hash == nhash && local_cache[c_idx].cid == cid`, the thread knows the bit is already marked for this country and immediately skips touching `COUNTRY_BITS` or `NAME_TABLE`, turning redundant lookups into 1-cycle L1 hits with zero shared-memory traffic.
+  2. **8-Byte SWAR Note Delimiter Scanning**:
+     - Replaced standard `std::memchr(..., 15000000)` calls with branchless 8-byte SWAR bit manipulation (`find_quote_swar` and `find_comma_swar`).
+     - Scans 8 bytes per iteration using `((x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL)` and `std::countr_zero`, eliminating function call register save/restore overhead on every record.
+  3. **Strict Memory Budget (<8 MB Peak RSS)**:
+     - Peak memory footprint strictly maintained at **7.76 MB** (7,766,496 bytes), under the 8 MB constraint.
+- **Measurement**:
+  - Instructions retired further dropped to **1,221,293,760** (~84 million fewer instructions than Step 6).
+  - CPU cycles reduced to **904,913,111**.
+  - Local wall time on macOS: **45.2 ms** (and 18.5 ms on sample scale).
+  - Peak RSS: **7.76 MB** (< 8 MB).
+  - 100% bit-for-bit exact SHA-256 match verified across all scales:
+    - Full: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`
+    - Sample: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`
+    - Tiny: 100% byte-for-byte match against reference.
+
+

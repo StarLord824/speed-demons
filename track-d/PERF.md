@@ -54,3 +54,20 @@
   - Query wall time dropped significantly with near-perfect core utilization.
   - Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
+## Step 7: 4-Byte Packed Edges & Frontier-Balanced Bidirectional Dijkstra
+- **Hypothesis**:
+  1. Forward Dijkstra settled an average of 12,704 nodes per query. By balancing bidirectional search frontiers (`pq_f.size() <= pq_b.size()`), search radii from $s$ and $t$ meet at the midpoint, cutting settled nodes by >3.3x.
+  2. Storing 8-byte edges for both forward and reverse graphs would require 80 MB. Over 99.9% of edge weights are $< 2048$, allowing packing `(weight << 21) | to` into a single 4-byte `uint32_t` (20 MB forward, 20 MB backward), doubling cache line edge density (16 edges per 64-byte line) and keeping the bidirectional graph under 54 MB.
+  3. Evicting the 88 MB `graph.txt` mmap with `madvise(MADV_DONTNEED)` before query execution prevents the OS page cache from inflating container peak memory.
+- **Implementation**:
+  - Packed 4-byte edges `(w_code << 21) | to` with binary-searched flat overflow array for the rare $w \ge 2047$ edges.
+  - Bidirectional Dijkstra with frontier-size step selection (`pq_f.size() <= pq_b.size()`).
+  - Thread-local compact 16,384-slot `FlatMap64` (128 KB each, fitting into L1/L2 cache).
+  - Immediate `madvise(MADV_DONTNEED)` on graph file pages.
+- **Measurement**:
+  - Average popped nodes per query plummeted from 12,704 down to **3,786** (3.35x reduction).
+  - Retired instructions dropped from 8.60 billion to **4.40 billion** (49% reduction).
+  - Local wall clock time dropped to **0.84 s** (query execution time down to ~180 ms).
+  - Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
+
+
