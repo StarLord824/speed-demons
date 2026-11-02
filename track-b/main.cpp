@@ -83,7 +83,7 @@ inline bool bitset_andnot(uint64_t* dst, const uint64_t* src, size_t n) {
 static uint32_t WORD_BIT_SUM[65536];
 static uint8_t WORD_POPCNT[65536];
 static uint8_t CHAR_MAP[256];
-static uint64_t QUERY_TERM_FILTER[1024]; // 64K bits in L1 cache
+static uint64_t QUERY_TERM_FILTER[16384]; // 1M bits (128 KB, 7% FPR)
 
 struct InitTables {
     InitTables() {
@@ -132,52 +132,47 @@ inline uint64_t fnv1a_64(const char* s, size_t len) {
 }
 
 struct TermTable {
-    struct Slot {
-        uint64_t hash;
-        uint32_t str_offset;
-        uint16_t str_len;
-        uint32_t term_id;
-    };
-    std::vector<Slot> slots;
-    uint32_t mask;
+    static constexpr size_t CAP = 131072;
+    static constexpr uint32_t MASK = CAP - 1;
+    uint64_t hashes[CAP];
+    uint32_t tids[CAP];
+    uint32_t term_str_off[100000];
+    uint16_t term_str_len[100000];
     std::string string_pool;
     uint32_t count = 0;
 
-    void init(size_t cap) {
-        size_t actual_cap = 1;
-        while (actual_cap < cap * 2) actual_cap <<= 1;
-        slots.resize(actual_cap, {0, 0, 0, UINT32_MAX});
-        mask = actual_cap - 1;
-        string_pool.reserve(cap * 12);
+    void init(size_t) {
+        std::memset(hashes, 0, sizeof(hashes));
+        std::memset(tids, 0xFF, sizeof(tids));
+        string_pool.reserve(1000000);
     }
 
     uint32_t get_or_insert(const char* s, size_t len) {
         uint64_t h = fnv1a_64(s, len);
-        uint32_t idx = h & mask;
+        uint32_t idx = (uint32_t)h & MASK;
         while (true) {
-            if (slots[idx].term_id == UINT32_MAX) {
+            if (tids[idx] == UINT32_MAX) {
                 uint32_t tid = count++;
-                slots[idx].hash = h;
-                slots[idx].str_offset = (uint32_t)string_pool.size();
-                slots[idx].str_len = (uint16_t)len;
-                slots[idx].term_id = tid;
+                hashes[idx] = h;
+                tids[idx] = tid;
+                term_str_off[tid] = (uint32_t)string_pool.size();
+                term_str_len[tid] = (uint16_t)len;
                 string_pool.append(s, len);
                 return tid;
             }
-            if (slots[idx].hash == h && slots[idx].str_len == len &&
-                std::memcmp(string_pool.data() + slots[idx].str_offset, s, len) == 0) {
-                return slots[idx].term_id;
+            if (hashes[idx] == h) {
+                return tids[idx];
             }
-            idx = (idx + 1) & mask;
+            idx = (idx + 1) & MASK;
         }
     }
 
     inline uint32_t lookup(uint64_t h) const {
-        uint32_t idx = h & mask;
+        uint32_t idx = (uint32_t)h & MASK;
         while (true) {
-            if (slots[idx].term_id == UINT32_MAX) return UINT32_MAX;
-            if (slots[idx].hash == h) return slots[idx].term_id;
-            idx = (idx + 1) & mask;
+            if (tids[idx] == UINT32_MAX) return UINT32_MAX;
+            if (hashes[idx] == h) return tids[idx];
+            idx = (idx + 1) & MASK;
         }
     }
 };
@@ -309,7 +304,7 @@ int main(int argc, char** argv) {
                 }
                 uint32_t tid = terms.get_or_insert(lower_buf, w_len);
                 uint64_t qh = fnv1a_64(lower_buf, w_len);
-                uint32_t q_bit = (uint32_t)qh & 0xFFFF;
+                uint32_t q_bit = (uint32_t)qh & 0xFFFFF;
                 QUERY_TERM_FILTER[q_bit >> 6] |= (1ULL << (q_bit & 63));
                 q.bq.term_ids.push_back(tid);
             }
@@ -336,7 +331,7 @@ int main(int argc, char** argv) {
                 }
                 uint32_t tid = terms.get_or_insert(lower_buf, w_len);
                 uint64_t qh = fnv1a_64(lower_buf, w_len);
-                uint32_t q_bit = (uint32_t)qh & 0xFFFF;
+                uint32_t q_bit = (uint32_t)qh & 0xFFFFF;
                 QUERY_TERM_FILTER[q_bit >> 6] |= (1ULL << (q_bit & 63));
                 q.pq.term_ids.push_back(tid);
             }
@@ -347,18 +342,10 @@ int main(int argc, char** argv) {
 
     uint32_t num_terms = terms.count;
 
-    // Build term string view table for fast phrase verification
-    std::vector<uint32_t> term_str_off(num_terms);
-    std::vector<uint16_t> term_str_len(num_terms);
-    for (const auto& sl : terms.slots) {
-        if (sl.term_id != UINT32_MAX) {
-            term_str_off[sl.term_id] = sl.str_offset;
-            term_str_len[sl.term_id] = sl.str_len;
-        }
-    }
+    // Term views recorded directly in TermTable
     const char* term_pool_data = terms.string_pool.data();
     auto get_term_view = [&](uint32_t tid) -> std::string_view {
-        return std::string_view(term_pool_data + term_str_off[tid], term_str_len[tid]);
+        return std::string_view(term_pool_data + terms.term_str_off[tid], terms.term_str_len[tid]);
     };
 
     std::vector<uint32_t> query_term_freq(num_terms, 0);
@@ -451,7 +438,7 @@ int main(int argc, char** argv) {
                         ptr++;
                     }
 
-                    uint32_t q_bit = (uint32_t)h & 0xFFFF;
+                    uint32_t q_bit = (uint32_t)h & 0xFFFFF;
                     if ((QUERY_TERM_FILTER[q_bit >> 6] & (1ULL << (q_bit & 63))) == 0) continue;
 
                     uint32_t tid = terms.lookup(h);
@@ -657,6 +644,82 @@ int main(int argc, char** argv) {
                     const auto& bq = q.bq;
                     uint32_t t0 = bq.term_ids[0];
                     uint32_t hid0 = hot_id[t0];
+
+                    // FAST PATH: Sparse-Doc Evaluation
+                    // If no OR operator and t0 is non-hot (or df0 <= 1024), evaluate directly on sparse doc list!
+                    if (!bq.has_or && hid0 == UINT32_MAX) {
+                        uint32_t p0_start = postings_head[t0];
+                        uint32_t p0_end = postings_head[t0 + 1];
+                        uint32_t df0 = p0_end - p0_start;
+
+                        if (df0 <= 1024) {
+                            uint32_t cur_docs[1024];
+                            uint32_t cur_cnt = df0;
+                            std::memcpy(cur_docs, postings_data.data() + p0_start, df0 * sizeof(uint32_t));
+
+                            for (size_t op_i = 0; op_i < bq.ops.size() && cur_cnt > 0; ++op_i) {
+                                BoolOp op = bq.ops[op_i];
+                                uint32_t term_id = bq.term_ids[op_i + 1];
+                                uint32_t hid = hot_id[term_id];
+
+                                uint32_t new_cnt = 0;
+                                if (hid != UINT32_MAX) {
+                                    const uint64_t* bptr = hot_bitsets.data() + (size_t)hid * num_words;
+                                    if (op == BoolOp::AND) {
+                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                            uint32_t d = cur_docs[i];
+                                            if ((bptr[d / 64] >> (d % 64)) & 1) cur_docs[new_cnt++] = d;
+                                        }
+                                    } else { // NOT
+                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                            uint32_t d = cur_docs[i];
+                                            if (!((bptr[d / 64] >> (d % 64)) & 1)) cur_docs[new_cnt++] = d;
+                                        }
+                                    }
+                                } else {
+                                    uint32_t pstart = postings_head[term_id];
+                                    uint32_t pend = postings_head[term_id + 1];
+                                    if (op == BoolOp::AND) {
+                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                            uint32_t d = cur_docs[i];
+                                            if (std::binary_search(postings_data.data() + pstart, postings_data.data() + pend, d)) {
+                                                cur_docs[new_cnt++] = d;
+                                            }
+                                        }
+                                    } else { // NOT
+                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                            uint32_t d = cur_docs[i];
+                                            if (!std::binary_search(postings_data.data() + pstart, postings_data.data() + pend, d)) {
+                                                cur_docs[new_cnt++] = d;
+                                            }
+                                        }
+                                    }
+                                }
+                                cur_cnt = new_cnt;
+                            }
+
+                            if (cur_cnt == 0) {
+                                out_str.append("0 0\n");
+                            } else {
+                                uint64_t count = cur_cnt;
+                                uint64_t sum = 0;
+                                for (uint32_t i = 0; i < cur_cnt; ++i) sum += cur_docs[i];
+                                char* p = line_buf;
+                                p = u64_to_str(p, count);
+                                *p++ = ' ';
+                                p = u64_to_str(p, sum);
+                                uint32_t print_cnt = std::min(10U, cur_cnt);
+                                for (uint32_t i = 0; i < print_cnt; ++i) {
+                                    *p++ = ' ';
+                                    p = u64_to_str(p, cur_docs[i]);
+                                }
+                                *p++ = '\n';
+                                out_str.append(line_buf, p - line_buf);
+                            }
+                            continue;
+                        }
+                    }
+
                     bool is_cur_zero = false;
 
                     if (hid0 != UINT32_MAX) {
@@ -848,26 +911,47 @@ int main(int argc, char** argv) {
                         uint32_t seed_end = postings_head[pq.term_ids[min_idx] + 1];
                         candidates.reserve(seed_end - seed_start);
 
+                        uint32_t hot_check_hids[8];
+                        uint32_t hot_check_cnt = 0;
+                        struct NonHotCheck { uint32_t pstart, pend; };
+                        NonHotCheck non_hot_checks[8];
+                        uint32_t non_hot_cnt = 0;
+
+                        for (size_t i = 0; i < pq.term_ids.size(); ++i) {
+                            if (i == min_idx) continue;
+                            uint32_t tid = pq.term_ids[i];
+                            uint32_t hid = hot_id[tid];
+                            if (hid != UINT32_MAX) {
+                                hot_check_hids[hot_check_cnt++] = hid;
+                            } else {
+                                non_hot_checks[non_hot_cnt++] = { postings_head[tid], postings_head[tid + 1] };
+                            }
+                        }
+                        for (uint32_t i = 0; i < non_hot_cnt; ++i) {
+                            for (uint32_t j = i + 1; j < non_hot_cnt; ++j) {
+                                if ((non_hot_checks[j].pend - non_hot_checks[j].pstart) < (non_hot_checks[i].pend - non_hot_checks[i].pstart)) {
+                                    std::swap(non_hot_checks[i], non_hot_checks[j]);
+                                }
+                            }
+                        }
+
                         for (uint32_t idx = seed_start; idx < seed_end; ++idx) {
                             uint32_t d = postings_data[idx];
                             bool has_all = true;
-                            for (size_t i = 0; i < pq.term_ids.size(); ++i) {
-                                if (i == min_idx) continue;
-                                uint32_t tid = pq.term_ids[i];
-                                uint32_t hid = hot_id[tid];
-                                if (hid != UINT32_MAX) {
-                                    const uint64_t* bptr = hot_bitsets.data() + (size_t)hid * num_words;
-                                    if (!((bptr[d / 64] >> (d % 64)) & 1)) {
-                                        has_all = false;
-                                        break;
-                                    }
-                                } else {
-                                    uint32_t pstart = postings_head[tid];
-                                    uint32_t pend = postings_head[tid + 1];
-                                    if (!std::binary_search(postings_data.data() + pstart, postings_data.data() + pend, d)) {
-                                        has_all = false;
-                                        break;
-                                    }
+                            for (uint32_t i = 0; i < hot_check_cnt; ++i) {
+                                const uint64_t* bptr = hot_bitsets.data() + (size_t)hot_check_hids[i] * num_words;
+                                if (!((bptr[d / 64] >> (d % 64)) & 1)) {
+                                    has_all = false;
+                                    break;
+                                }
+                            }
+                            if (!has_all) continue;
+                            for (uint32_t i = 0; i < non_hot_cnt; ++i) {
+                                uint32_t pstart = non_hot_checks[i].pstart;
+                                uint32_t pend = non_hot_checks[i].pend;
+                                if (!std::binary_search(postings_data.data() + pstart, postings_data.data() + pend, d)) {
+                                    has_all = false;
+                                    break;
                                 }
                             }
                             if (has_all) candidates.push_back(d);

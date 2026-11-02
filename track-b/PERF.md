@@ -103,6 +103,25 @@
   - Peak memory footprint dropped to **137.1 MB**.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
+## Step 10: Compact L2 Term Table, 1M-Bit L2 Filter, Hybrid Sparse-Doc Boolean Evaluation & Ordered Phrase Verification
+- **Hypothesis**:
+  1. `TermTable`'s 24-byte `Slot` structures totaled 6.29 MB across 262,144 entries, exceeding the 1.25 MB L2 cache of the Intel i5-13500 P-cores and causing heavy L3 cache thrashing during multi-threaded token lookups. Splitting into flat arrays (`hashes[131072]` at 1.04 MB and `tids[131072]` at 0.52 MB) fits 100% within L2 cache.
+  2. The 64K-bit (8 KB) query filter had an observed 68.5% false positive rate when populated with 75,747 unique terms, allowing ~14 million unqueried words to trigger expensive hash table lookups. Expanding the filter to 1M bits (128 KB, fits in L2 cache) drops the false positive rate from 68.5% to 7.0%, eliminating 93% of unqueried hash lookups in a single instruction.
+  3. Over 44% of boolean queries have no `OR` operator and a sparse initial seed term ($df_0 \le 1024$). Constructing and clearing 31.25 KB bitsets (3,907 `uint64_t` words) and iterating all words with popcount/bit-sum for tiny doc sets wasted millions of instructions. Evaluating these sparse queries directly on a local doc array with $O(1)$ hot bitset filtering eliminates bitset allocations and full-word reductions entirely.
+  4. In phrase query candidate checking, verifying terms in arbitrary query order caused large `std::binary_search` lookups even when a hot term bit test would reject the document in 1 cycle. Checking hot terms first ($O(1)$ bit test) followed by non-hot terms sorted in ascending order of posting list size short-circuits candidate verification immediately.
+- **Implementation**:
+  - Replaced 24-byte `Slot` table with compact L2-resident `TermTable` (`hashes[131072]` and `tids[131072]`), tracking term string views directly upon insertion.
+  - Sized `QUERY_TERM_FILTER[16384]` to 1,048,576 bits (128 KB), filtering words via `uint32_t q_bit = (uint32_t)h & 0xFFFFF`.
+  - Added hybrid boolean execution: queries without `OR` and $df_0 \le 1024$ execute via direct array filtering (`cur_docs[1024]`) with $O(1)$ hot-term bit tests and binary searches on sparse lists, calculating count/sum/top-10 in $O(k)$ rather than scanning 3,907 bitset words.
+  - Reordered phrase candidate checks to test hot term bitsets first in $O(1)$ before conducting binary searches ordered by posting list size.
+- **Measurement**:
+  - Total retired instructions dropped from **11.28 billion to 10.35 billion** (-930 million instructions).
+  - CPU cycles elapsed dropped from **6.57 billion to 5.52 billion** (-1.05 billion cycles / -16.0%).
+  - Real wall time dropped to **0.84 s** (internal phase execution dropped under 500 ms).
+  - Peak memory footprint dropped to **132.8 MB**.
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+
 
 
 

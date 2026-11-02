@@ -2,8 +2,8 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <thread>
 #include <atomic>
+#include <thread>
 #include <cstring>
 #include <chrono>
 #include <bit>
@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -19,13 +20,15 @@
 #define HAS_AVX2 0
 #endif
 
-// regions.csv IDs are in [1..999,999]. Anything >= 1,000,000 is UNMATCHED (255).
+// regions.csv IDs are in [1..999,999]. Anything >= 1,000,000 is UNMATCHED (240).
+static const uint8_t UNMATCHED_CID = 240;
+static const uint32_t NUM_BUCKETS = 241;
 static uint8_t REGION_TO_COUNTRY[1000000];
 
 struct CountryInfo {
     char code[4];
 };
-static CountryInfo COUNTRIES[256];
+static CountryInfo COUNTRIES[NUM_BUCKETS];
 static uint32_t NUM_COUNTRIES = 0;
 static uint16_t CODE_TO_CID[26 * 26 * 26];
 
@@ -56,7 +59,6 @@ inline uint64_t fast_hash(const char* p, size_t len) {
         h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
         return h ^ (h >> 27);
     }
-    // len > 16
     uint64_t h = len * 0x9E3779B97F4A7C15ULL;
     size_t i = 0;
     while (i + 8 <= len) {
@@ -74,7 +76,6 @@ inline uint64_t fast_hash(const char* p, size_t len) {
     return h ^ (h >> 27);
 }
 
-// Fast quote search
 inline const char* find_quote(const char* ptr) {
 #if HAS_AVX2
     __m256i quotes = _mm256_set1_epi8('"');
@@ -100,7 +101,6 @@ inline const char* find_quote(const char* ptr) {
 #endif
 }
 
-// Fast comma search
 inline const char* find_comma(const char* ptr) {
 #if HAS_AVX2
     __m256i commas = _mm256_set1_epi8(',');
@@ -126,13 +126,10 @@ inline const char* find_comma(const char* ptr) {
 #endif
 }
 
-// Global lock-free 131,072 slot hash table mapping 64-bit hash -> slot index (1 MB)
 static const uint32_t TABLE_SIZE = 131072;
 static const uint32_t TABLE_MASK = TABLE_SIZE - 1;
 static std::atomic<uint64_t> NAME_TABLE[TABLE_SIZE];
-
-// Bitset: 256 countries x 2048 uint64 = 4 MB
-static std::atomic<uint64_t> COUNTRY_BITS[256][2048];
+static std::atomic<uint64_t> COUNTRY_BITS[NUM_BUCKETS][2048];
 
 struct ThreadCountryAgg {
     uint64_t count = 0;
@@ -145,8 +142,12 @@ struct ThreadCountryAgg {
 };
 
 struct ThreadContext {
-    ThreadCountryAgg aggs[256];
+    const char* start;
+    const char* end;
+    ThreadCountryAgg aggs[NUM_BUCKETS];
 };
+
+static ThreadContext TCONTEXTS[16];
 
 inline char* u64_to_str(char* buf, uint64_t val) {
     if (val == 0) { *buf++ = '0'; return buf; }
@@ -180,6 +181,155 @@ inline bool is_record_start(const char* ptr, const char* end) {
     return (ptr < end && *ptr == ',');
 }
 
+void* worker_thread(void* arg) {
+    ThreadContext* ctx = (ThreadContext*)arg;
+    const char* ptr = ctx->start;
+    const char* end = ctx->end;
+    auto& aggs = ctx->aggs;
+    char unescape_buf[64];
+
+    while (ptr < end) {
+        if (__builtin_expect((uint8_t)*ptr == 0xEF, 0)) {
+            if (ptr + 3 <= end && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) {
+                ptr += 3;
+            }
+        }
+        if (ptr >= end) break;
+
+        // 1. id
+        uint64_t rec_id = *ptr++ - '0';
+        while (*ptr != ',') {
+            rec_id = rec_id * 10 + (*ptr++ - '0');
+        }
+        ptr++; // skip ','
+
+        // 2. name
+        uint64_t nhash = 0;
+        uint16_t name_len = 0;
+        if (*ptr == '"') {
+            ptr++;
+            const char* start = ptr;
+            const char* q = find_quote(ptr);
+            if (__builtin_expect(*(q + 1) == ',', 1)) {
+                name_len = (uint16_t)(q - start);
+                nhash = fast_hash(start, name_len);
+                ptr = q + 2; // skip '"' and ','
+            } else {
+                size_t prefix_len = q - start;
+                std::memcpy(unescape_buf, start, prefix_len);
+                int ulen = (int)prefix_len;
+                const char* cur = q;
+                while (true) {
+                    if (*(cur + 1) == '"') {
+                        unescape_buf[ulen++] = '"';
+                        cur += 2;
+                        const char* nq = find_quote(cur);
+                        size_t seg = nq - cur;
+                        std::memcpy(unescape_buf + ulen, cur, seg);
+                        ulen += (int)seg;
+                        cur = nq;
+                    } else {
+                        ptr = cur + 2; // skip '"' and ','
+                        break;
+                    }
+                }
+                name_len = ulen;
+                nhash = fast_hash(unescape_buf, ulen);
+            }
+        } else {
+            const char* start = ptr;
+            const char* c = find_comma(ptr);
+            name_len = (uint16_t)(c - start);
+            nhash = fast_hash(start, name_len);
+            ptr = c + 1;
+        }
+
+        // 3. note
+        uint32_t note_bytes = 0;
+        if (*ptr == '"') {
+            ptr++;
+            const char* start = ptr;
+            const char* q = find_quote(ptr);
+            if (__builtin_expect(*(q + 1) == ',', 1)) {
+                note_bytes = (uint32_t)(q - start);
+                ptr = q + 2;
+            } else {
+                uint32_t quote_pairs = 0;
+                while (true) {
+                    if (*(q + 1) == '"') {
+                        quote_pairs++;
+                        q = find_quote(q + 2);
+                    } else {
+                        note_bytes = (uint32_t)(q - start) - quote_pairs;
+                        ptr = q + 2; // skip '"' and ','
+                        break;
+                    }
+                }
+            }
+        } else {
+            const char* start = ptr;
+            const char* c = find_comma(ptr);
+            note_bytes = (uint32_t)(c - start);
+            ptr = c + 1;
+        }
+
+        // 4. region_id
+        uint32_t reg_id = *ptr++ - '0';
+        while (*ptr != ',') {
+            reg_id = reg_id * 10 + (*ptr++ - '0');
+        }
+        ptr++; // skip ','
+
+        // 5. amount
+        bool neg = (*ptr == '-');
+        if (neg) ptr++;
+        int64_t cents = *ptr++ - '0';
+        while (*ptr != '.') {
+            cents = cents * 10 + (*ptr++ - '0');
+        }
+        ptr++; // skip '.'
+        cents = cents * 100 + (*ptr - '0') * 10 + (*(ptr + 1) - '0');
+        ptr += 2;
+        if (neg) cents = -cents;
+
+        if (ptr < end && *ptr == '\r') ptr++;
+        if (ptr < end && *ptr == '\n') ptr++;
+
+        uint8_t cid = (reg_id < 1000000) ? REGION_TO_COUNTRY[reg_id] : UNMATCHED_CID;
+        ThreadCountryAgg& agg = aggs[cid];
+        agg.count++;
+        agg.id_sum += rec_id;
+        agg.amount_sum += cents;
+        agg.amount_min = std::min(agg.amount_min, cents);
+        agg.amount_max = std::max(agg.amount_max, cents);
+        agg.name_bytes += name_len;
+        agg.note_bytes += note_bytes;
+
+        if (nhash == 0) nhash = 1;
+        uint32_t slot = (uint32_t)nhash & TABLE_MASK;
+        uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
+        while (true) {
+            uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
+            if (__builtin_expect(val == nhash, 1)) break;
+            if (val == 0) {
+                uint64_t expected = 0;
+                if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
+                    break;
+                }
+                if (expected == nhash) break;
+            }
+            slot = (slot + step) & TABLE_MASK;
+        }
+
+        uint32_t word_idx = slot >> 6;
+        uint64_t bit_mask = 1ULL << (slot & 63);
+        if (__builtin_expect((COUNTRY_BITS[cid][word_idx].load(std::memory_order_relaxed) & bit_mask) == 0, 1)) {
+            COUNTRY_BITS[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
+        }
+    }
+    return nullptr;
+}
+
 int main(int argc, char** argv) {
     std::string data_dir = "/data";
     std::string out_dir = "/out";
@@ -188,7 +338,7 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--out" && i + 1 < argc) out_dir = argv[++i];
     }
 
-    std::memset(REGION_TO_COUNTRY, 0xFF, sizeof(REGION_TO_COUNTRY));
+    std::memset(REGION_TO_COUNTRY, UNMATCHED_CID, sizeof(REGION_TO_COUNTRY));
     std::memset(CODE_TO_CID, 0xFF, sizeof(CODE_TO_CID));
 
     // 1. Parse regions.csv
@@ -241,9 +391,9 @@ int main(int argc, char** argv) {
     }
     munmap((void*)rdata, rsize);
 
-    COUNTRIES[255].code[0] = '_';
-    COUNTRIES[255].code[1] = 'U';
-    COUNTRIES[255].code[2] = 'N';
+    COUNTRIES[UNMATCHED_CID].code[0] = '_';
+    COUNTRIES[UNMATCHED_CID].code[1] = 'U';
+    COUNTRIES[UNMATCHED_CID].code[2] = 'N';
 
     // 2. Open records.csv
     std::string rec_path = data_dir + "/records.csv";
@@ -265,8 +415,9 @@ int main(int argc, char** argv) {
     if (file_start < file_end && *file_start == '\n') file_start++;
 
     unsigned int num_threads = 12;
-    if (num_threads > std::thread::hardware_concurrency() && std::thread::hardware_concurrency() > 0) {
-        num_threads = std::thread::hardware_concurrency();
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw > 0 && hw < num_threads) {
+        num_threads = hw;
     }
 
     size_t records_bytes = file_end - file_start;
@@ -289,189 +440,21 @@ int main(int argc, char** argv) {
         chunk_starts[t] = approx;
     }
 
-    std::vector<ThreadContext> tcontexts(num_threads);
-    std::vector<std::thread> workers;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536);
 
-    const uint32_t CACHE_SIZE = 2048;
-    const uint32_t CACHE_MASK = CACHE_SIZE - 1;
+    pthread_t threads[16];
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        TCONTEXTS[t].start = chunk_starts[t];
+        TCONTEXTS[t].end = chunk_starts[t + 1];
+        pthread_create(&threads[t], &attr, worker_thread, &TCONTEXTS[t]);
+    }
+    pthread_attr_destroy(&attr);
 
     for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            const char* ptr = chunk_starts[t];
-            const char* end = chunk_starts[t + 1];
-            auto& aggs = tcontexts[t].aggs;
-
-            struct CacheEntry {
-                uint64_t hash;
-                uint32_t slot;
-                uint16_t cid;
-            };
-            CacheEntry local_cache[CACHE_SIZE];
-            std::memset(local_cache, 0xFF, sizeof(local_cache));
-
-            char unescape_buf[64];
-
-            while (ptr < end) {
-                if (__builtin_expect((uint8_t)*ptr == 0xEF, 0)) {
-                    if (ptr + 3 <= end && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) {
-                        ptr += 3;
-                    }
-                }
-                if (ptr >= end) break;
-
-                // 1. id
-                uint64_t rec_id = *ptr++ - '0';
-                while (*ptr != ',') {
-                    rec_id = rec_id * 10 + (*ptr++ - '0');
-                }
-                ptr++; // skip ','
-
-                // 2. name
-                uint64_t nhash = 0;
-                uint16_t name_len = 0;
-                if (*ptr == '"') {
-                    ptr++;
-                    const char* start = ptr;
-                    const char* q = find_quote(ptr);
-                    ptr = q;
-                    if (__builtin_expect(*(ptr + 1) == ',', 1)) {
-                        name_len = (uint16_t)(ptr - start);
-                        nhash = fast_hash(start, name_len);
-                        ptr += 2; // skip '"' and ','
-                    } else {
-                        int ulen = 0;
-                        for (const char* p = start; p < q; ++p) unescape_buf[ulen++] = *p;
-                        while (true) {
-                            if (*ptr == '"') {
-                                if (*(ptr + 1) == '"') {
-                                    unescape_buf[ulen++] = '"';
-                                    ptr += 2;
-                                } else {
-                                    ptr++; // skip closing '"'
-                                    break;
-                                }
-                            } else {
-                                unescape_buf[ulen++] = *ptr++;
-                            }
-                        }
-                        ptr++; // skip ','
-                        name_len = ulen;
-                        nhash = fast_hash(unescape_buf, ulen);
-                    }
-                } else {
-                    const char* start = ptr;
-                    const char* c = find_comma(ptr);
-                    name_len = (uint16_t)(c - start);
-                    nhash = fast_hash(start, name_len);
-                    ptr = c + 1;
-                }
-
-                // 3. note
-                uint32_t note_bytes = 0;
-                if (*ptr == '"') {
-                    ptr++;
-                    const char* start = ptr;
-                    const char* q = find_quote(ptr);
-                    ptr = q;
-                    if (__builtin_expect(*(ptr + 1) == ',', 1)) {
-                        note_bytes = (uint32_t)(ptr - start);
-                        ptr += 2;
-                    } else {
-                        note_bytes = (uint32_t)(ptr - start);
-                        while (true) {
-                            if (*ptr == '"') {
-                                if (*(ptr + 1) == '"') {
-                                    note_bytes++;
-                                    ptr += 2;
-                                } else {
-                                    ptr++;
-                                    break;
-                                }
-                            } else {
-                                note_bytes++;
-                                ptr++;
-                            }
-                        }
-                        ptr++;
-                    }
-                } else {
-                    const char* start = ptr;
-                    const char* c = find_comma(ptr);
-                    note_bytes = (uint32_t)(c - start);
-                    ptr = c + 1;
-                }
-
-                // 4. region_id
-                uint32_t reg_id = *ptr++ - '0';
-                while (*ptr != ',') {
-                    reg_id = reg_id * 10 + (*ptr++ - '0');
-                }
-                ptr++; // skip ','
-
-                // 5. amount
-                bool neg = (*ptr == '-');
-                if (neg) ptr++;
-                int64_t cents = *ptr++ - '0';
-                while (*ptr != '.') {
-                    cents = cents * 10 + (*ptr++ - '0');
-                }
-                ptr++; // skip '.'
-                cents = cents * 100 + (*ptr - '0') * 10 + (*(ptr + 1) - '0');
-                ptr += 2;
-                if (neg) cents = -cents;
-
-                if (ptr < end && *ptr == '\r') ptr++;
-                if (ptr < end && *ptr == '\n') ptr++;
-
-                uint8_t cid = (reg_id < 1000000) ? REGION_TO_COUNTRY[reg_id] : 255;
-                ThreadCountryAgg& agg = aggs[cid];
-                agg.count++;
-                agg.id_sum += rec_id;
-                agg.amount_sum += cents;
-                agg.amount_min = std::min(agg.amount_min, cents);
-                agg.amount_max = std::max(agg.amount_max, cents);
-                agg.name_bytes += name_len;
-                agg.note_bytes += note_bytes;
-
-                // Thread-local Cache Lookup
-                if (nhash == 0) nhash = 1;
-                uint32_t c_idx = (uint32_t)nhash & CACHE_MASK;
-                uint32_t slot;
-                if (local_cache[c_idx].hash == nhash) {
-                    slot = local_cache[c_idx].slot;
-                    if (local_cache[c_idx].cid == cid) {
-                        continue;
-                    }
-                    local_cache[c_idx].cid = cid;
-                } else {
-                    slot = (uint32_t)nhash & TABLE_MASK;
-                    uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
-                    while (true) {
-                        uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
-                        if (__builtin_expect(val == nhash, 1)) break;
-                        if (val == 0) {
-                            uint64_t expected = 0;
-                            if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed)) {
-                                break;
-                            }
-                            if (expected == nhash) break;
-                        }
-                        slot = (slot + step) & TABLE_MASK;
-                    }
-                    local_cache[c_idx] = {nhash, slot, (uint16_t)cid};
-                }
-
-                uint32_t word_idx = slot >> 6;
-                uint64_t bit_mask = 1ULL << (slot & 63);
-                if (__builtin_expect((COUNTRY_BITS[cid][word_idx].load(std::memory_order_relaxed) & bit_mask) == 0, 0)) {
-                    COUNTRY_BITS[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
-                }
-            }
-        });
+        pthread_join(threads[t], nullptr);
     }
-
-    for (auto& w : workers) w.join();
-    workers.clear();
     munmap((void*)rec_data, rec_size);
 
     struct FinalAgg {
@@ -487,11 +470,11 @@ int main(int argc, char** argv) {
         std::string country_code;
     };
 
-    std::vector<FinalAgg> final_aggs(256);
-    for (int c = 0; c < 256; ++c) {
-        final_aggs[c].country_code = (c == 255) ? "_UNMATCHED" : std::string(COUNTRIES[c].code, 3);
+    std::vector<FinalAgg> final_aggs(NUM_BUCKETS);
+    for (int c = 0; c < (int)NUM_BUCKETS; ++c) {
+        final_aggs[c].country_code = (c == UNMATCHED_CID) ? "_UNMATCHED" : std::string(COUNTRIES[c].code, 3);
         for (unsigned int t = 0; t < num_threads; ++t) {
-            const auto& tagg = tcontexts[t].aggs[c];
+            const auto& tagg = TCONTEXTS[t].aggs[c];
             if (tagg.count == 0) continue;
             final_aggs[c].has_record = true;
             final_aggs[c].count += tagg.count;
@@ -514,7 +497,7 @@ int main(int argc, char** argv) {
     }
 
     std::vector<FinalAgg> active;
-    for (int c = 0; c < 256; ++c) {
+    for (int c = 0; c < (int)NUM_BUCKETS; ++c) {
         if (final_aggs[c].has_record) active.push_back(final_aggs[c]);
     }
     std::sort(active.begin(), active.end(), [](const FinalAgg& a, const FinalAgg& b) {

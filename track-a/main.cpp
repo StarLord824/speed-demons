@@ -86,6 +86,19 @@ inline char* u64_to_str(char* buf, uint64_t val) {
     return buf;
 }
 
+inline uint32_t u32_len(uint32_t v) {
+    if (v < 10) return 1;
+    if (v < 100) return 2;
+    if (v < 1000) return 3;
+    if (v < 10000) return 4;
+    if (v < 100000) return 5;
+    if (v < 1000000) return 6;
+    if (v < 10000000) return 7;
+    if (v < 100000000) return 8;
+    if (v < 1000000000) return 9;
+    return 10;
+}
+
 inline uint8_t decode_hour(const char* ts) {
     uint32_t d = (ts[8] * 10 + ts[9]) - 528;
     uint32_t h = (ts[11] * 10 + ts[12]) - 528;
@@ -421,62 +434,27 @@ int main(int argc, char** argv) {
     // Munmap all_latencies immediately!
     munmap(all_latencies, lat_bytes);
 
-    // PHASE 5: Parallel output formatting
-    struct ThreadOut {
-        char* buf{nullptr};
-        size_t cap{0};
-        size_t len{0};
-    };
-    std::vector<ThreadOut> thread_output(num_threads);
-
+    // PHASE 5: Parallel output formatting via compact 64 KB stack buffers and pwrite
+    std::vector<size_t> thread_bytes(num_threads, 0);
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             size_t start_idx = (num_active * t) / num_threads;
             size_t end_idx = (num_active * (t + 1)) / num_threads;
-
-            ThreadOut& tout = thread_output[t];
-            tout.cap = (end_idx - start_idx) * 110;
-            tout.buf = (char*)mmap(nullptr, tout.cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            char* dst = tout.buf;
-
+            size_t bytes = 0;
             for (size_t i = start_idx; i < end_idx; ++i) {
                 const auto& sum = summaries[i];
                 uint32_t gid = active_groups[i];
-                uint32_t hr = gid / num_eps;
                 uint32_t epid = gid % num_eps;
                 uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
                 uint32_t errors_val = total_errs[gid];
                 uint64_t ppm = ((uint64_t)errors_val * 1000000ULL) / count;
 
-                std::memcpy(dst, HOURS_STR[hr], 20);
-                dst += 20;
-                *dst++ = ' ';
-
                 uint32_t intern_id = sorted_intern_ids[epid];
                 auto ep_str = ep_table.ep_strings[intern_id];
-                std::memcpy(dst, g_ep_storage + ep_str.offset, ep_str.len);
-                dst += ep_str.len;
-                *dst++ = ' ';
 
-                dst = u32_to_str(dst, count);
-                *dst++ = ' ';
-
-                dst = u32_to_str(dst, sum.p50);
-                *dst++ = ' ';
-
-                dst = u32_to_str(dst, sum.p95);
-                *dst++ = ' ';
-
-                dst = u32_to_str(dst, sum.p99);
-                *dst++ = ' ';
-
-                dst = u32_to_str(dst, errors_val);
-                *dst++ = ' ';
-
-                dst = u64_to_str(dst, ppm);
-                *dst++ = '\n';
+                bytes += 21 + ep_str.len + 1 + u32_len(count) + 1 + u32_len(sum.p50) + 1 + u32_len(sum.p95) + 1 + u32_len(sum.p99) + 1 + u32_len(errors_val) + 1 + u32_len((uint32_t)ppm) + 1;
             }
-            tout.len = dst - tout.buf;
+            thread_bytes[t] = bytes;
         });
     }
     for (auto& w : workers) w.join();
@@ -486,10 +464,72 @@ int main(int argc, char** argv) {
     std::string out_path = out_dir + "/summary.txt";
     int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (out_fd >= 0) {
+        std::vector<size_t> thread_offsets(num_threads + 1, 0);
         for (unsigned int t = 0; t < num_threads; ++t) {
-            write(out_fd, thread_output[t].buf, thread_output[t].len);
-            munmap(thread_output[t].buf, thread_output[t].cap);
+            thread_offsets[t + 1] = thread_offsets[t] + thread_bytes[t];
         }
+        ftruncate(out_fd, thread_offsets[num_threads]);
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&, t]() {
+                size_t start_idx = (num_active * t) / num_threads;
+                size_t end_idx = (num_active * (t + 1)) / num_threads;
+
+                char buf[65536];
+                char* dst = buf;
+                char* buf_end = buf + sizeof(buf) - 256;
+                size_t cur_offset = thread_offsets[t];
+
+                for (size_t i = start_idx; i < end_idx; ++i) {
+                    const auto& sum = summaries[i];
+                    uint32_t gid = active_groups[i];
+                    uint32_t hr = gid / num_eps;
+                    uint32_t epid = gid % num_eps;
+                    uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
+                    uint32_t errors_val = total_errs[gid];
+                    uint64_t ppm = ((uint64_t)errors_val * 1000000ULL) / count;
+
+                    std::memcpy(dst, HOURS_STR[hr], 20);
+                    dst += 20;
+                    *dst++ = ' ';
+
+                    uint32_t intern_id = sorted_intern_ids[epid];
+                    auto ep_str = ep_table.ep_strings[intern_id];
+                    std::memcpy(dst, g_ep_storage + ep_str.offset, ep_str.len);
+                    dst += ep_str.len;
+                    *dst++ = ' ';
+
+                    dst = u32_to_str(dst, count);
+                    *dst++ = ' ';
+
+                    dst = u32_to_str(dst, sum.p50);
+                    *dst++ = ' ';
+
+                    dst = u32_to_str(dst, sum.p95);
+                    *dst++ = ' ';
+
+                    dst = u32_to_str(dst, sum.p99);
+                    *dst++ = ' ';
+
+                    dst = u32_to_str(dst, errors_val);
+                    *dst++ = ' ';
+
+                    dst = u64_to_str(dst, ppm);
+                    *dst++ = '\n';
+
+                    if (dst >= buf_end) {
+                        pwrite(out_fd, buf, dst - buf, cur_offset);
+                        cur_offset += (dst - buf);
+                        dst = buf;
+                    }
+                }
+                if (dst > buf) {
+                    pwrite(out_fd, buf, dst - buf, cur_offset);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        workers.clear();
         close(out_fd);
     }
 
