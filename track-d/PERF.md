@@ -70,4 +70,21 @@
   - Local wall clock time dropped to **0.84 s** (query execution time down to ~180 ms).
   - Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
+## Step 8: Ingestion Fast-Paths & Empirical Verification of Forward vs. Bidirectional Search
+- **Hypothesis**:
+  1. Self-loops ($u == v$) never improve shortest paths for $s \neq t$ and can be omitted during edge parsing, saving unnecessary degree increments and memory allocations.
+  2. A tight newline scanner during Pass 1 avoids redundant ASCII digit testing.
+  3. A theoretical proposal suggested discarding the reverse CSR graph to save memory and relying solely on Forward Dijkstra with an in-degree bitset. We experimentally test whether Forward Dijkstra or Bidirectional Dijkstra provides better total runtime and memory efficiency.
+- **Implementation**:
+  - Filtered self-loops (`u != v`) across both Pass 1 and Pass 2.
+  - Sized edge buffers exactly to `f_tot` and `b_tot` valid edges.
+  - Profiled side-by-side Forward-Only Dijkstra vs. Frontier-Balanced Bidirectional Dijkstra on all 2,000 queries.
+- **Empirical Measurement**:
+  - **Bidirectional Dijkstra**: 208.5 ms query time, 7,573,742 total settled nodes (3,786 per query).
+  - **Forward-Only Dijkstra**: 498.6 ms query time, 24,903,182 total settled nodes (12,452 per query).
+  - Saving ~48 ms of reverse graph CSR construction by dropping the reverse graph results in a massive net penalty (+290 ms of extra Dijkstra search time), making forward-only search **~242 ms slower overall**.
+  - Bidirectional search with 4-byte packed edges remains strictly superior in wall time and retired instructions (4.40B vs 9.45B) while remaining well within the 65 MB container footprint.
+  - Correctness 100% verified with exact SHA-256 match `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
+
+
 

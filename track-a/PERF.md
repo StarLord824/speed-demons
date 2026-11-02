@@ -83,4 +83,17 @@
   - **Execution Time**: Local wall time **36.5 ms** (best run, mean 42.7 ms). Parallel `pwrite` formatting completes in just **1.75 ms**.
   - **Projected Score**: $K \approx 42 - 50$, lifting Track A Speed Score to **81 - 85 points**.
 
+## Step 10: 16K Zero-Collision Hash Interning, 4-Way Unrolled Scatter, and Range-Narrowed Selection
+- **Hypothesis**: Expanding the intern hash table capacity to 16,384 slots will drop the load factor to 11.2% and eliminate probe collisions. Unrolling the Phase 3 scatter loop 4-way will maximize CPU pipelining and memory write throughput. Narrowing the search range for the 2nd and 3rd `std::nth_element` passes to `[slice + idx + 1, slice + count]` and short-circuiting when percentiles coincide will eliminate redundant partitions.
+- **Implementation**:
+  1. **16K Slot Table**: `HASH_CAPACITY = 16384` with `HASH_MASK = 16383` (256 KB L2-resident table), bringing average probe length to ~1.2 probes with zero multi-hop collisions.
+  2. **4-Way Pipelined Scatter**: Phase 3 unrolls scattering 4 items per iteration, performing parallel group lookups and relaxed atomic position updates to hide memory latency.
+  3. **Range-Narrowed Nth-Element**: After finding `p50`, the search space for `p95` is narrowed to `slice + idx50 + 1` through `slice + count`. The 3rd pass for `p99` is narrowed to `slice + idx95 + 1`. Redundant partitioning is skipped entirely when `idx95 == idx50` or `idx99 == idx95`.
+- **Measurement**:
+  - **Verification**: 100% bit-for-bit exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
+  - Instructions retired dropped to **762.0M** (down from 800M+).
+  - CPU cycles down to **498M - 535M cycles**.
+  - Local wall time: **35.47 ms** (best run).
+  - Falkenstein projected wall time: **~18 - 22 ms** on dedicated hardware.
+
 

@@ -121,6 +121,25 @@
   - Peak memory footprint dropped to **132.8 MB**.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
+## Step 11: 4-Block Partitioning, 16-Bit Local Postings & Block-Scoped Intermediate Memory Freeing
+- **Hypothesis**:
+  1. Storing 10.78 million non-hot postings as global `uint32_t` values required 43.1 MB in `postings_data` and another 43.1 MB in `thread_tids`, causing a peak allocation spike of >130 MB when both existed simultaneously.
+  2. Partitioning the 250,000 documents into 4 disjoint blocks of $\le 62,528$ documents ensures that every local document ID relative to the block's base offset strictly fits into a `uint16_t` (2 bytes). This cuts the flat postings storage by exactly 50% (from 43.1 MB down to 21.56 MB).
+  3. By tokenizing and scattering each block sequentially across the 12 worker threads, thread intermediate vectors (`thread_tids`, `thread_doc_start`) are sized for only 1/4 of the corpus at any given time (~5 MB total across all 12 threads) and are immediately freed upon block completion via `.swap()`, preventing intermediate buffers from coexisting with the full corpus index.
+  4. In query evaluation, phrase candidate checking performs 16-bit binary searches within localized block slices, doubling cache line density (32 postings per 64-byte cache line) and improving L2 cache hit rates.
+- **Implementation**:
+  - Divided the 250,000 document corpus into 4 blocks of 977 64-doc words ($\le 62,528$ docs per block).
+  - Allocated per-block posting tables `block_postings_head[4]` (1.21 MB total) and `block_postings_data[4]` using `std::vector<uint16_t>`.
+  - Processed document ingestion block-by-block: 12 threads tokenize block $b$ into localized buffers, compute prefix sums for block $b$, scatter `uint16_t` offsets directly into `block_postings_data[b]`, and immediately release intermediate thread memory before advancing to block $b+1$.
+  - Updated hybrid boolean evaluation and phrase candidate checking to iterate over the 4 blocks, naturally generating matches in ascending document order without sorting.
+- **Measurement**:
+  - Peak memory footprint dropped from **132.8 MB to 83.2 MB** (-49.6 MB / -37.3% peak memory reduction).
+  - Total retired instructions: **10.46 billion**.
+  - CPU cycles elapsed: **5.74 billion**.
+  - Real wall time: **0.95 s** (internal phase execution ~470 ms).
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+
 
 
 

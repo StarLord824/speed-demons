@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
 
     uint32_t n = parse_u32(gptr);
     while (*gptr == ' ') gptr++;
-    uint32_t m = parse_u32(gptr);
+    (void)parse_u32(gptr);
     while (*gptr != '\n') gptr++;
     gptr++; // first byte of edges
 
@@ -220,10 +220,12 @@ int main(int argc, char** argv) {
             while (ptr < end) {
                 uint32_t u = parse_u32(ptr); ptr++;
                 uint32_t v = parse_u32(ptr); ptr++;
-                while (*ptr >= '0') ptr++;
-                if (ptr < end && *ptr == '\n') ptr++;
-                f_atomic_head[u].fetch_add(1, std::memory_order_relaxed);
-                b_atomic_head[v].fetch_add(1, std::memory_order_relaxed);
+                while (*ptr != '\n') ptr++;
+                ptr++;
+                if (__builtin_expect(u != v, 1)) {
+                    f_atomic_head[u].fetch_add(1, std::memory_order_relaxed);
+                    b_atomic_head[v].fetch_add(1, std::memory_order_relaxed);
+                }
             }
         });
     }
@@ -246,8 +248,8 @@ int main(int argc, char** argv) {
         b_atomic_head[i].store(b_head[i], std::memory_order_relaxed);
     }
 
-    std::vector<uint32_t> f_edges(m);
-    std::vector<uint32_t> b_edges(m);
+    std::vector<uint32_t> f_edges(f_tot);
+    std::vector<uint32_t> b_edges(b_tot);
 
     std::vector<std::vector<OverflowEntry>> local_f_ov(num_load_threads);
     std::vector<std::vector<OverflowEntry>> local_b_ov(num_load_threads);
@@ -263,6 +265,7 @@ int main(int argc, char** argv) {
                 uint32_t v = parse_u32(ptr); ptr++;
                 uint32_t w = parse_u32(ptr);
                 if (ptr < end && *ptr == '\n') ptr++;
+                if (__builtin_expect(u == v, 0)) continue;
 
                 uint32_t f_pos = f_atomic_head[u].fetch_add(1, std::memory_order_relaxed);
                 uint32_t b_pos = b_atomic_head[v].fetch_add(1, std::memory_order_relaxed);
