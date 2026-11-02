@@ -33,3 +33,22 @@
   3. Shared a 256 x 4,096 `uint64_t` atomic bitset array (`COUNTRY_BITS`) across all threads, setting bits with `fetch_or(..., std::memory_order_relaxed)`.
   4. Eliminated all thread-join hash set merging; computed final distinct counts via hardware `std::popcount`.
 - **Measurement**: Local execution time plummeted from 381 ms to 56.7 ms (nearly 7x faster). Total anonymous memory dropped to ~11 MB. Correctness 100% verified with exact SHA-256 match `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
+
+## Step 6: Memory Compaction (5 MB Tables), Double Hashing, Read-Filtered Bitsets, and Vectorized Delimiter Scanning
+- **Hypotheses & Optimizations**:
+  1. **Table Compaction & Double Hashing**: Reduced `NAME_TABLE` from 262k to 131k slots (1 MB) and `COUNTRY_BITS` from 8 MB to 4 MB (256 x 2,048 `uint64_t`). Replaced linear probing with double hashing (`step = ((nhash >> 17) | 1) & TABLE_MASK`) to eliminate primary clustering and keep all bitsets tightly fitting in L3 cache.
+  2. **Read-Filtered Atomic Bitset Writes**: Before executing `fetch_or` (`LOCK OR` on x86 which causes bus contention and cross-core cache invalidation storms), check if the bit is already set using relaxed read `(COUNTRY_BITS[cid][word].load() & bit_mask) == 0`. Since only ~100k distinct names exist across 3.32M records, this eliminates >97% of atomic write operations, turning almost all lookups into non-invalidating shared cache reads.
+  3. **Fast Delimiter & Vectorized Note Scanning**: Used `std::memchr` for quoted and unquoted note fields to scan 32-64 bytes per cycle, avoiding byte-by-byte loops for the ~75 MB of notes in the dataset.
+  4. **Contiguous Fast Path for Names**: Exploited CSV invariant that a closing quote followed by `,` indicates zero escaped quotes, enabling direct contiguous parsing without quote-escape branches.
+  5. **Branchless Integer Parsing & Country Aggregations**: Replaced digit loop range checks with single-byte delimiter checks (`*ptr != ','` and `*ptr != '.'`); replaced `if (!agg.has_record)` checks with branchless initialization (`INT64_MAX` / `INT64_MIN`) and branchless `std::min` / `std::max` (`cmov`).
+  6. **Zero-Allocation Single-Syscall Output**: Formatted aggregates into a stack-allocated buffer and flushed with a single `write(2)` syscall.
+- **Measurement**:
+  - Instructions retired dropped by **40.5%** from 2,196,507,998 to 1,303,609,123 (~893 million fewer instructions).
+  - CPU cycles dropped from 1,280,833,570 to 945,765,241.
+  - Peak memory footprint dropped from 12.5 MB to **7.4 MB** (and static BSS dropped from 11 MB to 5.04 MB).
+  - Wall time dropped from 56.7 ms to **40 ms** (0.04 s real).
+  - Bit-for-bit exact SHA-256 match verified across all scales:
+    - Full: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`
+    - Sample: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`
+    - Tiny: 100% byte-for-byte identical to Python reference.
+
