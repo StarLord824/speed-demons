@@ -2,9 +2,10 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <thread>
 #include <atomic>
 #include <cstring>
+#include <pthread.h>
+#include <thread>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -30,6 +31,36 @@ inline char* i64_to_str(char* buf, int64_t val) {
         val = -val;
     }
     return u64_to_str(buf, (uint64_t)val);
+}
+
+template<typename F>
+void run_threads(unsigned int num_threads, F&& func) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536);
+
+    struct ThreadData {
+        const F* fn;
+        unsigned int id;
+    };
+    std::vector<pthread_t> threads(num_threads);
+    std::vector<ThreadData> tdata(num_threads);
+
+    auto trampoline = [](void* arg) -> void* {
+        ThreadData* td = static_cast<ThreadData*>(arg);
+        (*(td->fn))(td->id);
+        return nullptr;
+    };
+
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        tdata[t] = {&func, t};
+        pthread_create(&threads[t], &attr, trampoline, &tdata[t]);
+    }
+    pthread_attr_destroy(&attr);
+
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        pthread_join(threads[t], nullptr);
+    }
 }
 
 // 4-ary Min-Heap with packed (dist << 21 | u)
@@ -183,9 +214,10 @@ int main(int argc, char** argv) {
 
     uint32_t n = parse_u32(gptr);
     while (*gptr == ' ') gptr++;
-    (void)parse_u32(gptr);
+    uint32_t m = parse_u32(gptr);
+    (void)m;
     while (*gptr != '\n') gptr++;
-    gptr++; // first byte of edges
+    gptr++;
 
     const char* edges_start = gptr;
     size_t edges_bytes = gend - edges_start;
@@ -205,48 +237,41 @@ int main(int argc, char** argv) {
         chunk_starts[t] = approx;
     }
 
-    std::vector<std::atomic<uint32_t>> f_atomic_head(n + 1);
-    std::vector<std::atomic<uint32_t>> b_atomic_head(n + 1);
-    for (uint32_t i = 0; i <= n; ++i) {
-        f_atomic_head[i].store(0, std::memory_order_relaxed);
-        b_atomic_head[i].store(0, std::memory_order_relaxed);
-    }
+    // Single unified head buffers: zero duplicate allocations
+    std::vector<uint32_t> f_head(n + 1, 0);
+    std::vector<uint32_t> b_head(n + 1, 0);
+    std::atomic<uint32_t>* af_head = reinterpret_cast<std::atomic<uint32_t>*>(f_head.data());
+    std::atomic<uint32_t>* ab_head = reinterpret_cast<std::atomic<uint32_t>*>(b_head.data());
 
-    std::vector<std::thread> workers;
-    for (unsigned int t = 0; t < num_load_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            const char* ptr = chunk_starts[t];
-            const char* end = chunk_starts[t + 1];
-            while (ptr < end) {
-                uint32_t u = parse_u32(ptr); ptr++;
-                uint32_t v = parse_u32(ptr); ptr++;
-                while (*ptr != '\n') ptr++;
-                ptr++;
-                if (__builtin_expect(u != v, 1)) {
-                    f_atomic_head[u].fetch_add(1, std::memory_order_relaxed);
-                    b_atomic_head[v].fetch_add(1, std::memory_order_relaxed);
-                }
+    // Pass 1: count degrees directly (skipping self-loops)
+    run_threads(num_load_threads, [&](unsigned int t) {
+        const char* ptr = chunk_starts[t];
+        const char* end = chunk_starts[t + 1];
+        while (ptr < end) {
+            uint32_t u = parse_u32(ptr); ptr++;
+            uint32_t v = parse_u32(ptr); ptr++;
+            while (*ptr != '\n') ptr++;
+            ptr++;
+            if (__builtin_expect(u != v, 1)) {
+                af_head[u].fetch_add(1, std::memory_order_relaxed);
+                ab_head[v].fetch_add(1, std::memory_order_relaxed);
             }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
+        }
+    });
 
-    std::vector<uint32_t> f_head(n + 1, 0), b_head(n + 1, 0);
+    // In-place prefix sum: head[i] becomes starting offset for node i
     uint32_t f_tot = 0, b_tot = 0;
     for (uint32_t i = 0; i < n; ++i) {
+        uint32_t fd = f_head[i];
         f_head[i] = f_tot;
-        f_tot += f_atomic_head[i].load(std::memory_order_relaxed);
+        f_tot += fd;
+
+        uint32_t bd = b_head[i];
         b_head[i] = b_tot;
-        b_tot += b_atomic_head[i].load(std::memory_order_relaxed);
+        b_tot += bd;
     }
     f_head[n] = f_tot;
     b_head[n] = b_tot;
-
-    for (uint32_t i = 0; i < n; ++i) {
-        f_atomic_head[i].store(f_head[i], std::memory_order_relaxed);
-        b_atomic_head[i].store(b_head[i], std::memory_order_relaxed);
-    }
 
     std::vector<uint32_t> f_edges(f_tot);
     std::vector<uint32_t> b_edges(b_tot);
@@ -254,38 +279,38 @@ int main(int argc, char** argv) {
     std::vector<std::vector<OverflowEntry>> local_f_ov(num_load_threads);
     std::vector<std::vector<OverflowEntry>> local_b_ov(num_load_threads);
 
-    for (unsigned int t = 0; t < num_load_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            local_f_ov[t].reserve(512);
-            local_b_ov[t].reserve(512);
-            const char* ptr = chunk_starts[t];
-            const char* end = chunk_starts[t + 1];
-            while (ptr < end) {
-                uint32_t u = parse_u32(ptr); ptr++;
-                uint32_t v = parse_u32(ptr); ptr++;
-                uint32_t w = parse_u32(ptr);
-                if (ptr < end && *ptr == '\n') ptr++;
-                if (__builtin_expect(u == v, 0)) continue;
+    // Pass 2: scatter edges directly using af_head/ab_head cursors
+    run_threads(num_load_threads, [&](unsigned int t) {
+        local_f_ov[t].reserve(512);
+        local_b_ov[t].reserve(512);
+        const char* ptr = chunk_starts[t];
+        const char* end = chunk_starts[t + 1];
+        while (ptr < end) {
+            uint32_t u = parse_u32(ptr); ptr++;
+            uint32_t v = parse_u32(ptr); ptr++;
+            uint32_t w = parse_u32(ptr);
+            if (ptr < end && *ptr == '\n') ptr++;
+            if (__builtin_expect(u == v, 0)) continue;
 
-                uint32_t f_pos = f_atomic_head[u].fetch_add(1, std::memory_order_relaxed);
-                uint32_t b_pos = b_atomic_head[v].fetch_add(1, std::memory_order_relaxed);
+            uint32_t f_pos = af_head[u].fetch_add(1, std::memory_order_relaxed);
+            uint32_t b_pos = ab_head[v].fetch_add(1, std::memory_order_relaxed);
 
-                uint32_t w_code = (w < 2047) ? w : 2047;
-                f_edges[f_pos] = (w_code << 21) | v;
-                b_edges[b_pos] = (w_code << 21) | u;
+            uint32_t w_code = (w < 2047) ? w : 2047;
+            f_edges[f_pos] = (w_code << 21) | v;
+            b_edges[b_pos] = (w_code << 21) | u;
 
-                if (__builtin_expect(w_code == 2047, 0)) {
-                    local_f_ov[t].push_back({f_pos, w});
-                    local_b_ov[t].push_back({b_pos, w});
-                }
+            if (__builtin_expect(w_code == 2047, 0)) {
+                local_f_ov[t].push_back({f_pos, w});
+                local_b_ov[t].push_back({b_pos, w});
             }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
+        }
+    });
 
-    std::vector<std::atomic<uint32_t>>().swap(f_atomic_head);
-    std::vector<std::atomic<uint32_t>>().swap(b_atomic_head);
+    // Shift heads back by 1 index so head[u] is start and head[u+1] is end
+    std::memmove(f_head.data() + 1, f_head.data(), (size_t)n * sizeof(uint32_t));
+    f_head[0] = 0;
+    std::memmove(b_head.data() + 1, b_head.data(), (size_t)n * sizeof(uint32_t));
+    b_head[0] = 0;
 
     madvise((void*)gdata, gsize, MADV_DONTNEED);
     munmap((void*)gdata, gsize);
@@ -351,109 +376,118 @@ int main(int argc, char** argv) {
         num_query_threads = std::thread::hardware_concurrency();
     }
 
-    for (unsigned int t = 0; t < num_query_threads; ++t) {
-        workers.emplace_back([&]() {
-            FlatMap64 map_f(16384), map_b(16384);
-            Fast4AryHeap pq_f, pq_b;
-            pq_f.reserve(16384);
-            pq_b.reserve(16384);
+    run_threads(num_query_threads, [&](unsigned int /*t*/) {
+        FlatMap64 map_f(16384), map_b(16384);
+        Fast4AryHeap pq_f, pq_b;
+        pq_f.reserve(16384);
+        pq_b.reserve(16384);
 
-            while (true) {
-                size_t qi = query_idx.fetch_add(1, std::memory_order_relaxed);
-                if (qi >= num_queries) break;
+        while (true) {
+            size_t qi = query_idx.fetch_add(1, std::memory_order_relaxed);
+            if (qi >= num_queries) break;
 
-                uint32_t s = queries[qi].s;
-                uint32_t trg = queries[qi].t;
+            uint32_t s = queries[qi].s;
+            uint32_t trg = queries[qi].t;
 
-                if (s == trg) { answers[qi] = 0; continue; }
-                if (b_head[trg + 1] == b_head[trg] || f_head[s + 1] == f_head[s]) {
-                    answers[qi] = -1;
-                    continue;
-                }
+            if (s == trg) { answers[qi] = 0; continue; }
+            if (b_head[trg + 1] == b_head[trg] || f_head[s + 1] == f_head[s]) {
+                answers[qi] = -1;
+                continue;
+            }
 
-                map_f.clear();
-                map_b.clear();
-                pq_f.clear();
-                pq_b.clear();
+            map_f.clear();
+            map_b.clear();
+            pq_f.clear();
+            pq_b.clear();
 
-                map_f.update(s, 0);
-                map_b.update(trg, 0);
-                pq_f.push(s);
-                pq_b.push(trg);
+            map_f.update(s, 0);
+            map_b.update(trg, 0);
+            pq_f.push(s);
+            pq_b.push(trg);
 
-                uint64_t best_dist = UINT64_MAX;
+            uint64_t best_dist = UINT64_MAX;
 
-                while (!pq_f.empty() && !pq_b.empty()) {
-                    uint64_t top_f = pq_f.top() >> 21;
-                    uint64_t top_b = pq_b.top() >> 21;
+            while (!pq_f.empty() && !pq_b.empty()) {
+                uint64_t top_f = pq_f.top() >> 21;
+                uint64_t top_b = pq_b.top() >> 21;
 
-                    if (top_f + top_b >= best_dist) break;
+                if (top_f + top_b >= best_dist) break;
 
-                    if (pq_f.size() <= pq_b.size()) {
-                        uint64_t top = pq_f.pop();
-                        uint64_t d = top >> 21;
-                        uint32_t u = (uint32_t)(top & 0x1FFFFF);
+                if (pq_f.size() <= pq_b.size()) {
+                    uint64_t top = pq_f.pop();
+                    uint64_t d = top >> 21;
+                    uint32_t u = (uint32_t)(top & 0x1FFFFF);
 
-                        uint64_t cur_df = map_f.get(u);
-                        if (d > cur_df) continue;
+                    uint64_t cur_df = map_f.get(u);
+                    if (d > cur_df) continue;
 
-                        uint64_t cur_db = map_b.get(u);
-                        if (cur_db != UINT64_MAX && d + cur_db < best_dist) {
-                            best_dist = d + cur_db;
+                    uint64_t cur_db = map_b.get(u);
+                    if (cur_db != UINT64_MAX && d + cur_db < best_dist) {
+                        best_dist = d + cur_db;
+                    }
+
+                    if (!pq_f.empty()) {
+                        uint32_t nu = (uint32_t)(pq_f.top() & 0x1FFFFF);
+                        __builtin_prefetch(&f_head[nu], 0, 1);
+                        __builtin_prefetch(&f_edges[f_head[nu]], 0, 1);
+                    }
+
+                    uint32_t start_e = f_head[u];
+                    uint32_t end_e = f_head[u + 1];
+                    for (uint32_t e = start_e; e < end_e; ++e) {
+                        uint32_t packed = f_edges[e];
+                        uint32_t v = packed & 0x1FFFFF;
+                        uint32_t w = packed >> 21;
+                        if (__builtin_expect(w == 2047, 0)) {
+                            w = lookup_overflow(e, f_ov_ptr, f_ov_sz);
                         }
-
-                        uint32_t start_e = f_head[u];
-                        uint32_t end_e = f_head[u + 1];
-                        for (uint32_t e = start_e; e < end_e; ++e) {
-                            uint32_t packed = f_edges[e];
-                            uint32_t v = packed & 0x1FFFFF;
-                            uint32_t w = packed >> 21;
-                            if (__builtin_expect(w == 2047, 0)) {
-                                w = lookup_overflow(e, f_ov_ptr, f_ov_sz);
-                            }
-                            uint64_t nd = d + w;
-                            if (nd >= best_dist) continue;
-                            if (map_f.update(v, nd)) {
-                                pq_f.push((nd << 21) | v);
-                            }
+                        uint64_t nd = d + w;
+                        if (nd >= best_dist) continue;
+                        if (map_f.update(v, nd)) {
+                            pq_f.push((nd << 21) | v);
                         }
-                    } else {
-                        uint64_t top = pq_b.pop();
-                        uint64_t d = top >> 21;
-                        uint32_t u = (uint32_t)(top & 0x1FFFFF);
+                    }
+                } else {
+                    uint64_t top = pq_b.pop();
+                    uint64_t d = top >> 21;
+                    uint32_t u = (uint32_t)(top & 0x1FFFFF);
 
-                        uint64_t cur_db = map_b.get(u);
-                        if (d > cur_db) continue;
+                    uint64_t cur_db = map_b.get(u);
+                    if (d > cur_db) continue;
 
-                        uint64_t cur_df = map_f.get(u);
-                        if (cur_df != UINT64_MAX && cur_df + d < best_dist) {
-                            best_dist = cur_df + d;
+                    uint64_t cur_df = map_f.get(u);
+                    if (cur_df != UINT64_MAX && cur_df + d < best_dist) {
+                        best_dist = cur_df + d;
+                    }
+
+                    if (!pq_b.empty()) {
+                        uint32_t nu = (uint32_t)(pq_b.top() & 0x1FFFFF);
+                        __builtin_prefetch(&b_head[nu], 0, 1);
+                        __builtin_prefetch(&b_edges[b_head[nu]], 0, 1);
+                    }
+
+                    uint32_t start_e = b_head[u];
+                    uint32_t end_e = b_head[u + 1];
+                    for (uint32_t e = start_e; e < end_e; ++e) {
+                        uint32_t packed = b_edges[e];
+                        uint32_t v = packed & 0x1FFFFF;
+                        uint32_t w = packed >> 21;
+                        if (__builtin_expect(w == 2047, 0)) {
+                            w = lookup_overflow(e, b_ov_ptr, b_ov_sz);
                         }
-
-                        uint32_t start_e = b_head[u];
-                        uint32_t end_e = b_head[u + 1];
-                        for (uint32_t e = start_e; e < end_e; ++e) {
-                            uint32_t packed = b_edges[e];
-                            uint32_t v = packed & 0x1FFFFF;
-                            uint32_t w = packed >> 21;
-                            if (__builtin_expect(w == 2047, 0)) {
-                                w = lookup_overflow(e, b_ov_ptr, b_ov_sz);
-                            }
-                            uint64_t nd = d + w;
-                            if (nd >= best_dist) continue;
-                            if (map_b.update(v, nd)) {
-                                pq_b.push((nd << 21) | v);
-                            }
+                        uint64_t nd = d + w;
+                        if (nd >= best_dist) continue;
+                        if (map_b.update(v, nd)) {
+                            pq_b.push((nd << 21) | v);
                         }
                     }
                 }
-
-                if (best_dist != UINT64_MAX) answers[qi] = (int64_t)best_dist;
-                else answers[qi] = -1;
             }
-        });
-    }
-    for (auto& w : workers) w.join();
+
+            if (best_dist != UINT64_MAX) answers[qi] = (int64_t)best_dist;
+            else answers[qi] = -1;
+        }
+    });
 
     mkdir(out_dir.c_str(), 0777);
     std::string out_path = out_dir + "/distances.txt";

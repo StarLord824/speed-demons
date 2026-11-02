@@ -3,11 +3,11 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
-#include <thread>
 #include <mutex>
 #include <atomic>
 #include <cstring>
 #include <cstdint>
+#include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -85,9 +85,22 @@ inline char* u64_to_str(char* buf, uint64_t val) {
     return buf;
 }
 
+inline uint32_t u32_len(uint32_t val) {
+    if (val < 10) return 1;
+    if (val < 100) return 2;
+    if (val < 1000) return 3;
+    if (val < 10000) return 4;
+    if (val < 100000) return 5;
+    if (val < 1000000) return 6;
+    if (val < 10000000) return 7;
+    if (val < 100000000) return 8;
+    if (val < 1000000000) return 9;
+    return 10;
+}
+
 inline uint8_t decode_hour(const char* ts) {
-    uint32_t d = (ts[8] - '0') * 10 + (ts[9] - '0');
-    uint32_t h = (ts[11] - '0') * 10 + (ts[12] - '0');
+    uint32_t d = (uint32_t)(ts[8] - '0') * 10 + (uint32_t)(ts[9] - '0');
+    uint32_t h = (uint32_t)(ts[11] - '0') * 10 + (uint32_t)(ts[12] - '0');
     uint32_t day_off = (ts[6] == '0') ? (d - 30) : (d + 1);
     return (uint8_t)(day_off * 24 + h - 18);
 }
@@ -113,8 +126,38 @@ inline uint64_t swar_hash_and_find_end(const char* s, const char*& ep_end) {
     }
 }
 
+template<typename F>
+static void run_workers(unsigned int num_threads, const F& fn) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536); // 64 KB stack per thread
+
+    struct ThreadContext {
+        unsigned int id;
+        const F* fn;
+    };
+
+    pthread_t threads[16] = {};
+    ThreadContext contexts[16] = {};
+
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        contexts[t].id = t;
+        contexts[t].fn = &fn;
+        pthread_create(&threads[t], &attr, [](void* arg) -> void* {
+            auto* ctx = static_cast<ThreadContext*>(arg);
+            (*ctx->fn)(ctx->id);
+            return nullptr;
+        }, &contexts[t]);
+    }
+    pthread_attr_destroy(&attr);
+
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        pthread_join(threads[t], nullptr);
+    }
+}
+
 constexpr size_t MAX_ENDPOINTS = 4096;
-constexpr size_t HASH_CAPACITY = 8192;
+constexpr size_t HASH_CAPACITY = 16384;
 constexpr size_t HASH_MASK = HASH_CAPACITY - 1;
 
 struct TableEntry {
@@ -123,27 +166,35 @@ struct TableEntry {
     uint16_t sorted_id;
 };
 
+struct EpString {
+    uint32_t offset;
+    uint16_t len;
+};
+
+static char g_ep_storage[256 * 1024];
+static std::atomic<uint32_t> g_ep_storage_offset{0};
+
 struct GlobalEpTable {
     TableEntry slots[HASH_CAPACITY];
-    std::string_view ep_strings[MAX_ENDPOINTS];
+    EpString ep_strings[MAX_ENDPOINTS];
     std::atomic<uint32_t> count{0};
 
     uint32_t get_or_insert(const char* s, size_t len, uint64_t h) {
         uint32_t slot = (uint32_t)h & HASH_MASK;
         while (true) {
             uint64_t entry_h = slots[slot].hash;
-            if (entry_h == h) {
-                return slots[slot].intern_id;
-            }
+            if (entry_h == h) return slots[slot].intern_id;
             if (entry_h == 0) {
                 static std::mutex insert_mutex;
                 std::lock_guard<std::mutex> lock(insert_mutex);
-                if (slots[slot].hash == h) {
-                    return slots[slot].intern_id;
-                }
+                if (slots[slot].hash == h) return slots[slot].intern_id;
                 if (slots[slot].hash == 0) {
                     uint32_t new_id = count.load(std::memory_order_relaxed);
-                    ep_strings[new_id] = std::string_view(s, len);
+                    uint32_t off = g_ep_storage_offset.load(std::memory_order_relaxed);
+                    std::memcpy(g_ep_storage + off, s, len);
+                    g_ep_storage_offset.store(off + (uint32_t)len, std::memory_order_relaxed);
+
+                    ep_strings[new_id] = {off, (uint16_t)len};
                     count.store(new_id + 1, std::memory_order_relaxed);
                     slots[slot].intern_id = (uint16_t)new_id;
                     slots[slot].sorted_id = (uint16_t)new_id;
@@ -155,7 +206,7 @@ struct GlobalEpTable {
         }
     }
 
-    uint32_t lookup_sorted(uint64_t h) const {
+    inline uint32_t lookup_sorted(uint64_t h) const {
         uint32_t slot = (uint32_t)h & HASH_MASK;
         while (true) {
             if (slots[slot].hash == h) {
@@ -209,9 +260,6 @@ int main(int argc, char** argv) {
     close(fd);
 
     unsigned int num_threads = 12;
-    if (num_threads > std::thread::hardware_concurrency() && std::thread::hardware_concurrency() > 0) {
-        num_threads = std::thread::hardware_concurrency();
-    }
 
     std::vector<size_t> chunk_starts(num_threads + 1, 0);
     for (unsigned int i = 1; i < num_threads; ++i) {
@@ -222,70 +270,83 @@ int main(int argc, char** argv) {
     }
     chunk_starts[num_threads] = file_size;
 
-    std::vector<std::thread> workers;
+    std::memset(ep_table.slots, 0, sizeof(ep_table.slots));
+    g_ep_storage_offset.store(0, std::memory_order_relaxed);
+    ep_table.count.store(0, std::memory_order_relaxed);
 
-    // PASS 1: Count frequencies and discover endpoints
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            const char* ptr = data + chunk_starts[t];
-            const char* end = data + chunk_starts[t + 1];
+    for (size_t i = 0; i < TOTAL_GROUPS_CAP; ++i) {
+        counts[i].store(0, std::memory_order_relaxed);
+        errors[i].store(0, std::memory_order_relaxed);
+    }
 
-            while (ptr < end) {
-                uint8_t hr = decode_hour(ptr);
+    // PASS 1: Count frequencies and discover endpoints, skipping latency completely
+    run_workers(num_threads, [&](unsigned int t) {
+        const char* ptr = data + chunk_starts[t];
+        const char* end = data + chunk_starts[t + 1];
 
-                const char* ep_start;
-                if (ptr[31] == ' ') ep_start = ptr + 32;
-                else if (ptr[32] == ' ') ep_start = ptr + 33;
-                else if (ptr[35] == ' ') ep_start = ptr + 36;
-                else if (ptr[33] == ' ') ep_start = ptr + 34;
-                else if (ptr[34] == ' ') ep_start = ptr + 35;
-                else {
-                    ptr += 28;
-                    while (*ptr != ' ') ptr++;
-                    ptr++;
-                    ep_start = ptr;
-                }
+        while (ptr < end) {
+            uint8_t hr = decode_hour(ptr);
 
-                const char* ep_end;
-                uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
-                uint32_t intern_id = ep_table.get_or_insert(ep_start, ep_end - ep_start, h);
+            const char* ep_start;
+            if (ptr[31] == ' ') ep_start = ptr + 32;
+            else if (ptr[32] == ' ') ep_start = ptr + 33;
+            else if (ptr[35] == ' ') ep_start = ptr + 36;
+            else if (ptr[33] == ' ') ep_start = ptr + 34;
+            else if (ptr[34] == ' ') ep_start = ptr + 35;
+            else {
+                ptr += 28;
+                while (*ptr != ' ') ptr++;
+                ptr++;
+                ep_start = ptr;
+            }
 
-                ptr = ep_end + 1;
-                bool is_err = (ptr[0] == '5');
+            const char* ep_end;
+            uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
+            uint32_t intern_id = ep_table.get_or_insert(ep_start, ep_end - ep_start, h);
 
-                uint32_t gid = (uint32_t)hr * 2048 + intern_id;
-                counts[gid].fetch_add(1, std::memory_order_relaxed);
-                if (is_err) {
-                    errors[gid].fetch_add(1, std::memory_order_relaxed);
-                }
+            ptr = ep_end + 1;
+            bool is_err = (ptr[0] == '5');
 
+            uint32_t gid = (uint32_t)hr * 2048 + intern_id;
+            counts[gid].fetch_add(1, std::memory_order_relaxed);
+            if (is_err) {
+                errors[gid].fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // Skip latency completely using SWAR newline search from status code
+            const char* p = ptr + 4; // latency starts at ptr + 4
+            if (__builtin_expect(p + 8 <= data + file_size, 1)) {
                 uint64_t v;
-                std::memcpy(&v, ptr + 4, 8);
+                std::memcpy(&v, p, 8);
                 uint64_t x = v ^ 0x0A0A0A0A0A0A0A0AULL;
                 uint64_t mask = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
                 if (mask != 0) {
                     int off = __builtin_ctzll(mask) >> 3;
-                    ptr = (ptr + 4) + off + 1;
+                    ptr = p + off + 1;
                 } else {
-                    ptr = (const char*)memchr(ptr + 4, '\n', 32) + 1;
+                    while (*p != '\n' && p < data + file_size) p++;
+                    ptr = p + 1;
                 }
+            } else {
+                while (*p != '\n' && p < data + file_size) p++;
+                ptr = p + 1;
             }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
+        }
+    });
 
     uint32_t num_eps = ep_table.count.load(std::memory_order_relaxed);
 
     std::vector<uint32_t> sorted_intern_ids(num_eps);
     for (uint32_t i = 0; i < num_eps; ++i) sorted_intern_ids[i] = i;
     std::sort(sorted_intern_ids.begin(), sorted_intern_ids.end(), [&](uint32_t a, uint32_t b) {
-        std::string_view sa = ep_table.ep_strings[a];
-        std::string_view sb = ep_table.ep_strings[b];
-        size_t min_len = std::min(sa.size(), sb.size());
-        int cmp = std::memcmp(sa.data(), sb.data(), min_len);
+        auto sa = ep_table.ep_strings[a];
+        auto sb = ep_table.ep_strings[b];
+        const char* pa = g_ep_storage + sa.offset;
+        const char* pb = g_ep_storage + sb.offset;
+        size_t min_len = std::min((size_t)sa.len, (size_t)sb.len);
+        int cmp = std::memcmp(pa, pb, min_len);
         if (cmp != 0) return cmp < 0;
-        return sa.size() < sb.size();
+        return sa.len < sb.len;
     });
 
     std::vector<uint16_t> intern_to_sorted(num_eps);
@@ -326,13 +387,57 @@ int main(int argc, char** argv) {
     size_t lat_bytes = total_items * sizeof(uint32_t);
     uint32_t* all_latencies = (uint32_t*)mmap(nullptr, lat_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-    // PASS 2: Parse and scatter directly into all_latencies
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            const char* ptr = data + chunk_starts[t];
-            const char* end = data + chunk_starts[t + 1];
+    // PASS 2: Parse and stream latencies with 4-way unrolled writing
+    run_workers(num_threads, [&](unsigned int t) {
+        const char* ptr = data + chunk_starts[t];
+        const char* end = data + chunk_starts[t + 1];
 
-            while (ptr < end) {
+        while (ptr < end) {
+            if (ptr + 400 < end) {
+                uint32_t gids[4];
+                uint32_t lats[4];
+
+                for (int k = 0; k < 4; ++k) {
+                    uint8_t hr = decode_hour(ptr);
+
+                    const char* ep_start;
+                    if (ptr[31] == ' ') ep_start = ptr + 32;
+                    else if (ptr[32] == ' ') ep_start = ptr + 33;
+                    else if (ptr[35] == ' ') ep_start = ptr + 36;
+                    else if (ptr[33] == ' ') ep_start = ptr + 34;
+                    else if (ptr[34] == ' ') ep_start = ptr + 35;
+                    else {
+                        ptr += 28;
+                        while (*ptr != ' ') ptr++;
+                        ptr++;
+                        ep_start = ptr;
+                    }
+
+                    const char* ep_end;
+                    uint64_t h = swar_hash_and_find_end(ep_start, ep_end);
+                    uint32_t sorted_ep = ep_table.lookup_sorted(h);
+                    gids[k] = (uint32_t)hr * num_eps + sorted_ep;
+
+                    ptr = ep_end + 5;
+                    uint32_t lat = (uint32_t)(*ptr++ - '0');
+                    while (true) {
+                        char c = *ptr++;
+                        if (c == '\n') break;
+                        lat = lat * 10 + (uint32_t)(c - '0');
+                    }
+                    lats[k] = lat;
+                }
+
+                uint32_t pos0 = write_pos[gids[0]].fetch_add(1, std::memory_order_relaxed);
+                uint32_t pos1 = write_pos[gids[1]].fetch_add(1, std::memory_order_relaxed);
+                uint32_t pos2 = write_pos[gids[2]].fetch_add(1, std::memory_order_relaxed);
+                uint32_t pos3 = write_pos[gids[3]].fetch_add(1, std::memory_order_relaxed);
+
+                all_latencies[pos0] = lats[0];
+                all_latencies[pos1] = lats[1];
+                all_latencies[pos2] = lats[2];
+                all_latencies[pos3] = lats[3];
+            } else {
                 uint8_t hr = decode_hour(ptr);
 
                 const char* ep_start;
@@ -354,80 +459,110 @@ int main(int argc, char** argv) {
                 uint32_t gid = (uint32_t)hr * num_eps + sorted_ep;
 
                 ptr = ep_end + 5;
-                uint32_t lat = *ptr++ - '0';
-                while (*ptr != '\n') {
-                    lat = lat * 10 + (*ptr++ - '0');
+                uint32_t lat = (uint32_t)(*ptr++ - '0');
+                while (true) {
+                    char c = *ptr++;
+                    if (c == '\n') break;
+                    lat = lat * 10 + (uint32_t)(c - '0');
                 }
-                ptr++;
 
                 uint32_t pos = write_pos[gid].fetch_add(1, std::memory_order_relaxed);
                 all_latencies[pos] = lat;
             }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
+        }
+    });
 
-    // Optimized percentiles
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            size_t start_idx = (num_active * t) / num_threads;
-            size_t end_idx = (num_active * (t + 1)) / num_threads;
+    // Immediately after Pass 2: release and unmap data file completely!
+    madvise((void*)data, file_size, MADV_DONTNEED);
+    munmap((void*)data, file_size);
 
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                uint32_t gid = active_groups[i];
-                uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
-                uint32_t start_pos = group_offsets[gid];
+    // PHASE 4: Optimized percentiles with narrowed nth_element search space
+    run_workers(num_threads, [&](unsigned int t) {
+        size_t start_idx = (num_active * t) / num_threads;
+        size_t end_idx = (num_active * (t + 1)) / num_threads;
 
-                uint32_t* slice = all_latencies + start_pos;
-                size_t idx50 = (50ULL * count + 99) / 100 - 1;
-                size_t idx95 = (95ULL * count + 99) / 100 - 1;
-                size_t idx99 = (99ULL * count + 99) / 100 - 1;
+        for (size_t i = start_idx; i < end_idx; ++i) {
+            uint32_t gid = active_groups[i];
+            uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
+            uint32_t start_pos = group_offsets[gid];
 
-                uint32_t p50, p95, p99;
-                if (count <= 16) {
-                    std::sort(slice, slice + count);
-                    p50 = slice[idx50];
-                    p95 = slice[idx95];
-                    p99 = slice[idx99];
+            uint32_t* slice = all_latencies + start_pos;
+            size_t idx50 = (50ULL * count + 99) / 100 - 1;
+            size_t idx95 = (95ULL * count + 99) / 100 - 1;
+            size_t idx99 = (99ULL * count + 99) / 100 - 1;
+
+            uint32_t p50, p95, p99;
+            if (count <= 16) {
+                std::sort(slice, slice + count);
+                p50 = slice[idx50];
+                p95 = slice[idx95];
+                p99 = slice[idx99];
+            } else {
+                std::nth_element(slice, slice + idx50, slice + count);
+                p50 = slice[idx50];
+
+                if (idx95 == idx50) {
+                    p95 = p50;
                 } else {
-                    std::nth_element(slice, slice + idx50, slice + count);
-                    p50 = slice[idx50];
-
-                    std::nth_element(slice + idx50, slice + idx95, slice + count);
+                    std::nth_element(slice + idx50 + 1, slice + idx95, slice + count);
                     p95 = slice[idx95];
-
-                    std::nth_element(slice + idx95, slice + idx99, slice + count);
-                    p99 = slice[idx99];
                 }
 
-                summaries[i] = {p50, p95, p99};
+                if (idx99 == idx95) {
+                    p99 = p95;
+                } else {
+                    std::nth_element(slice + idx95 + 1, slice + idx99, slice + count);
+                    p99 = slice[idx99];
+                }
             }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
+
+            summaries[i] = {p50, p95, p99};
+        }
+    });
 
     // Munmap all_latencies immediately!
     munmap(all_latencies, lat_bytes);
 
-    // Parallel fast raw buffer output formatting
-    struct ThreadOut {
-        char* buf{nullptr};
-        size_t cap{0};
-        size_t len{0};
-    };
-    std::vector<ThreadOut> thread_output(num_threads);
+    // PHASE 5: Parallel output formatting via compact 16 KB stack buffers and pwrite
+    std::vector<size_t> thread_bytes(num_threads, 0);
+    run_workers(num_threads, [&](unsigned int t) {
+        size_t start_idx = (num_active * t) / num_threads;
+        size_t end_idx = (num_active * (t + 1)) / num_threads;
+        size_t bytes = 0;
+        for (size_t i = start_idx; i < end_idx; ++i) {
+            const auto& sum = summaries[i];
+            uint32_t gid = active_groups[i];
+            uint32_t epid = gid % num_eps;
+            uint32_t count = group_offsets[gid + 1] - group_offsets[gid];
+            uint32_t errors_val = total_errs[gid];
+            uint64_t ppm = ((uint64_t)errors_val * 1000000ULL) / count;
 
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
+            uint32_t intern_id = sorted_intern_ids[epid];
+            auto ep_str = ep_table.ep_strings[intern_id];
+
+            bytes += 21 + ep_str.len + 1 + u32_len(count) + 1 + u32_len(sum.p50) + 1 + u32_len(sum.p95) + 1 + u32_len(sum.p99) + 1 + u32_len(errors_val) + 1 + u32_len((uint32_t)ppm) + 1;
+        }
+        thread_bytes[t] = bytes;
+    });
+
+    mkdir(out_dir.c_str(), 0777);
+    std::string out_path = out_dir + "/summary.txt";
+    int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (out_fd >= 0) {
+        std::vector<size_t> thread_offsets(num_threads + 1, 0);
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            thread_offsets[t + 1] = thread_offsets[t] + thread_bytes[t];
+        }
+        ftruncate(out_fd, thread_offsets[num_threads]);
+
+        run_workers(num_threads, [&](unsigned int t) {
             size_t start_idx = (num_active * t) / num_threads;
             size_t end_idx = (num_active * (t + 1)) / num_threads;
 
-            ThreadOut& tout = thread_output[t];
-            tout.cap = (end_idx - start_idx) * 110;
-            tout.buf = (char*)mmap(nullptr, tout.cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            char* dst = tout.buf;
+            char buf[16384];
+            char* dst = buf;
+            char* buf_end = buf + sizeof(buf) - 256;
+            size_t cur_offset = thread_offsets[t];
 
             for (size_t i = start_idx; i < end_idx; ++i) {
                 const auto& sum = summaries[i];
@@ -443,9 +578,9 @@ int main(int argc, char** argv) {
                 *dst++ = ' ';
 
                 uint32_t intern_id = sorted_intern_ids[epid];
-                std::string_view ep = ep_table.ep_strings[intern_id];
-                std::memcpy(dst, ep.data(), ep.size());
-                dst += ep.size();
+                auto ep_str = ep_table.ep_strings[intern_id];
+                std::memcpy(dst, g_ep_storage + ep_str.offset, ep_str.len);
+                dst += ep_str.len;
                 *dst++ = ' ';
 
                 dst = u32_to_str(dst, count);
@@ -465,24 +600,19 @@ int main(int argc, char** argv) {
 
                 dst = u64_to_str(dst, ppm);
                 *dst++ = '\n';
-            }
-            tout.len = dst - tout.buf;
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
 
-    mkdir(out_dir.c_str(), 0777);
-    std::string out_path = out_dir + "/summary.txt";
-    int out_fd = open(out_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
-    if (out_fd >= 0) {
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            write(out_fd, thread_output[t].buf, thread_output[t].len);
-            munmap(thread_output[t].buf, thread_output[t].cap);
-        }
+                if (dst >= buf_end) {
+                    pwrite(out_fd, buf, dst - buf, cur_offset);
+                    cur_offset += (dst - buf);
+                    dst = buf;
+                }
+            }
+            if (dst > buf) {
+                pwrite(out_fd, buf, dst - buf, cur_offset);
+            }
+        });
         close(out_fd);
     }
 
-    munmap((void*)data, file_size);
     return 0;
 }

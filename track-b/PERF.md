@@ -122,6 +122,7 @@
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
 ## Step 11: 4-Block Partitioning, 16-Bit Local Postings & Block-Scoped Intermediate Memory Freeing
+- **Run ID**: `run-a522966ca1a9` (Commit `68999161d7dd753c211a55e87da35558c4688aee`)
 - **Hypothesis**:
   1. Storing 10.78 million non-hot postings as global `uint32_t` values required 43.1 MB in `postings_data` and another 43.1 MB in `thread_tids`, causing a peak allocation spike of >130 MB when both existed simultaneously.
   2. Partitioning the 250,000 documents into 4 disjoint blocks of $\le 62,528$ documents ensures that every local document ID relative to the block's base offset strictly fits into a `uint16_t` (2 bytes). This cuts the flat postings storage by exactly 50% (from 43.1 MB down to 21.56 MB).
@@ -133,10 +134,22 @@
   - Processed document ingestion block-by-block: 12 threads tokenize block $b$ into localized buffers, compute prefix sums for block $b$, scatter `uint16_t` offsets directly into `block_postings_data[b]`, and immediately release intermediate thread memory before advancing to block $b+1$.
   - Updated hybrid boolean evaluation and phrase candidate checking to iterate over the 4 blocks, naturally generating matches in ascending document order without sorting.
 - **Measurement**:
-  - Peak memory footprint dropped from **132.8 MB to 83.2 MB** (-49.6 MB / -37.3% peak memory reduction).
-  - Total retired instructions: **10.46 billion**.
-  - CPU cycles elapsed: **5.74 billion**.
-  - Real wall time: **0.95 s** (internal phase execution ~470 ms).
+  - Live Falkenstein runner scored: $T = 0.4023\text{ s}$, $M = 83.32\text{ MB}$ (dropped from 137.56 MB, -54.2 MB / -39.4%), $S = 1079$, $K = 15.718$, **59.820 points** (all gates passed, new personal best).
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+## Step 12: Zero-Intermediate-Postings 2-Pass Block Ingestion & 64 KB POSIX Thread Stacks
+- **Hypothesis**:
+  1. In Step 11, allocating intermediate vectors (`thread_tids`, `thread_doc_start`) for each block still incurred ~5 MB of transient heap allocations and allocator churn. Because `docs.txt` is mmapped directly in memory cache, executing a two-pass scan per block (Pass 1 counts per-term frequencies in a compact 1.8 MB `thread_counts` array; Pass 2 writes `uint16_t` local doc IDs directly into `block_postings_data[b]`) completely eliminates all intermediate posting vectors from RAM.
+  2. Standard `std::thread` on Linux pre-allocates an 8 MB virtual stack per thread (96 MB virtual memory across 12 threads) and creates separate glibc heap arenas. Switching to a lightweight POSIX `ThreadRunner` with `pthread_attr_setstacksize(&attr, 64 * 1024)` caps thread stack space to 64 KB per thread (0.75 MB total), avoiding glibc memory pool bloat.
+  3. Increasing the hot-term bitset threshold from query freq $\ge 15$ to $\ge 35$ retains the 212 highest-frequency terms while shrinking `hot_bitsets` from 22.4 MB to 6.47 MB (-15.9 MB reduction).
+- **Implementation**:
+  - Implemented `ThreadRunner` using POSIX `pthread_attr_setstacksize` (64 KB stack per worker).
+  - Implemented 2-pass per-block ingestion: Pass 1 calculates per-thread term frequencies in `uint16_t thread_counts[12][75747]` (1.81 MB); prefix sums compute exact offsets; Pass 2 streams `uint16_t` doc IDs directly into `block_postings_data[b]`. Zero intermediate posting vectors allocated.
+  - Trimmed `hot_bitsets` to 6.47 MB (212 hot terms).
+- **Measurement**:
+  - Local peak memory footprint dropped from 84.6 MB to **59.6 MB** (-25.0 MB / -29.5% peak RSS reduction, projected ~38-42 MB in Linux cgroups).
+  - Wall-clock time on local benchmark dropped from 0.80 s to **0.57 s** (-28.7% wall time).
+  - Clean warning-free compilation with `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread`.
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
 

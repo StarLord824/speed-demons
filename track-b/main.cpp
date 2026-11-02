@@ -2,13 +2,13 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
-#include <thread>
 #include <cstring>
 #include <cstdint>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -199,6 +199,35 @@ struct Query {
 static uint32_t doc_text_off[250000];
 static uint16_t doc_text_len[250000];
 
+// Lightweight pthread runner with 64 KB stack per thread to eliminate excess stack RSS
+struct ThreadRunner {
+    template<typename F>
+    static void run(unsigned int n, F&& fn) {
+        std::vector<pthread_t> threads(n);
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 64 * 1024);
+
+        struct Worker {
+            F* f;
+            unsigned int id;
+        };
+        std::vector<Worker> workers(n);
+        for (unsigned int t = 0; t < n; ++t) {
+            workers[t] = { &fn, t };
+            pthread_create(&threads[t], &attr, [](void* arg) -> void* {
+                auto* w = static_cast<Worker*>(arg);
+                (*(w->f))(w->id);
+                return nullptr;
+            }, &workers[t]);
+        }
+        pthread_attr_destroy(&attr);
+        for (unsigned int t = 0; t < n; ++t) {
+            pthread_join(threads[t], nullptr);
+        }
+    }
+};
+
 const char* find_doc_start(const char* data, size_t size, uint32_t target_doc) {
     if (target_doc == 0) return data;
     size_t low = 0, high = size;
@@ -357,11 +386,11 @@ int main(int argc, char** argv) {
     uint32_t num_docs = 250000;
     uint32_t num_words = (num_docs + 63) / 64;
 
-    // Hot terms: 718 terms with query freq >= 15 = 22.4 MB bitsets
+    // Hot terms threshold: query freq >= 35 gives 212 hot terms = 6.47 MB bitsets!
     std::vector<uint32_t> hot_id(num_terms, UINT32_MAX);
     uint32_t num_hot_terms = 0;
     for (uint32_t tid = 0; tid < num_terms; ++tid) {
-        if (query_term_freq[tid] >= 15) {
+        if (query_term_freq[tid] >= 35) {
             hot_id[tid] = num_hot_terms++;
         }
     }
@@ -388,19 +417,16 @@ int main(int argc, char** argv) {
     close(dfd);
 
     unsigned int num_threads = 12;
-    if (num_threads > std::thread::hardware_concurrency() && std::thread::hardware_concurrency() > 0) {
-        num_threads = std::thread::hardware_concurrency();
-    }
 
     // Per-block postings: block_postings_head[4][num_terms + 1] and block_postings_data[4] (uint16_t)
     std::vector<std::vector<uint32_t>> block_postings_head(NUM_BLOCKS, std::vector<uint32_t>(num_terms + 1, 0));
     std::vector<std::vector<uint16_t>> block_postings_data(NUM_BLOCKS);
 
-    std::vector<std::thread> workers;
+    // Reusable thread_counts buffer: 12 * 75747 * 2 = 1.81 MB!
+    std::vector<std::vector<uint16_t>> thread_counts(num_threads, std::vector<uint16_t>(num_terms, 0));
+    std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_terms, 0));
 
-    // Process Block by Block in a SINGLE pass over docs.txt!
-    // At any moment, thread intermediate buffers are sized for ONLY 1 block (1/4 of corpus, ~5 MB total)
-    // and freed immediately upon block completion!
+    // Process Block by Block with 2-pass per block: ZERO thread_tids vectors allocated!
     for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
         uint32_t b_d_start = block_d_start[b];
         uint32_t b_d_end = block_d_end[b];
@@ -417,71 +443,55 @@ int main(int argc, char** argv) {
             b_thread_chunk_starts[t] = find_doc_start(ddata, dsize, b_thread_d_start[t]);
         }
 
-        std::vector<std::vector<uint32_t>> thread_tids(num_threads);
-        std::vector<std::vector<uint32_t>> thread_doc_start(num_threads);
-        std::vector<std::vector<uint32_t>> thread_counts(num_threads, std::vector<uint32_t>(num_terms, 0));
-
         for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                uint32_t d_start = b_thread_d_start[t];
-                uint32_t d_end = b_thread_d_start[t + 1];
-                uint32_t num_d = d_end - d_start;
-                auto& tids = thread_tids[t];
-                auto& doc_start = thread_doc_start[t];
-                auto& counts = thread_counts[t];
-                tids.reserve(num_d * 53);
-                doc_start.resize(num_d + 1);
+            std::memset(thread_counts[t].data(), 0, num_terms * sizeof(uint16_t));
+        }
 
-                std::vector<uint32_t> last_seen_doc(num_terms, UINT32_MAX);
+        // PASS 1 for Block b: Count frequencies & populate hot bitsets directly
+        ThreadRunner::run(num_threads, [&](unsigned int t) {
+            uint32_t d_start = b_thread_d_start[t];
+            uint32_t d_end = b_thread_d_start[t + 1];
+            auto& counts = thread_counts[t];
+            std::vector<uint32_t> last_seen_doc(num_terms, UINT32_MAX);
 
-                const char* ptr = b_thread_chunk_starts[t];
-                const char* end = b_thread_chunk_starts[t + 1];
+            const char* ptr = b_thread_chunk_starts[t];
+            const char* end = b_thread_chunk_starts[t + 1];
 
-                for (uint32_t doc_id = d_start; doc_id < d_end; ++doc_id) {
-                    doc_start[doc_id - d_start] = (uint32_t)tids.size();
-                    while (ptr < end && *ptr != '\t') ptr++;
-                    if (ptr < end) ptr++;
-                    const char* text_start = ptr;
+            for (uint32_t doc_id = d_start; doc_id < d_end; ++doc_id) {
+                while (ptr < end && *ptr != '\t') ptr++;
+                if (ptr < end) ptr++;
 
-                    while (ptr < end && *ptr != '\n') {
-                        while (ptr < end && *ptr != '\n' && CHAR_MAP[(uint8_t)*ptr] == 0) ptr++;
-                        if (ptr >= end || *ptr == '\n') break;
+                while (ptr < end && *ptr != '\n') {
+                    while (ptr < end && *ptr != '\n' && CHAR_MAP[(uint8_t)*ptr] == 0) ptr++;
+                    if (ptr >= end || *ptr == '\n') break;
 
-                        uint64_t h = 14695981039346656037ULL;
-                        while (ptr < end) {
-                            uint8_t lc = CHAR_MAP[(uint8_t)*ptr];
-                            if (lc == 0) break;
-                            h = (h ^ lc) * 1099511628211ULL;
-                            ptr++;
-                        }
+                    uint64_t h = 14695981039346656037ULL;
+                    while (ptr < end) {
+                        uint8_t lc = CHAR_MAP[(uint8_t)*ptr];
+                        if (lc == 0) break;
+                        h = (h ^ lc) * 1099511628211ULL;
+                        ptr++;
+                    }
 
-                        uint32_t q_bit = (uint32_t)h & 0xFFFFF;
-                        if ((QUERY_TERM_FILTER[q_bit >> 6] & (1ULL << (q_bit & 63))) == 0) continue;
+                    uint32_t q_bit = (uint32_t)h & 0xFFFFF;
+                    if ((QUERY_TERM_FILTER[q_bit >> 6] & (1ULL << (q_bit & 63))) == 0) continue;
 
-                        uint32_t tid = terms.lookup(h);
-                        if (tid != UINT32_MAX) {
-                            if (last_seen_doc[tid] != doc_id) {
-                                last_seen_doc[tid] = doc_id;
-                                uint32_t hid = hot_id[tid];
-                                if (hid != UINT32_MAX) {
-                                    hot_bitsets[(size_t)hid * num_words + (doc_id / 64)] |= (1ULL << (doc_id % 64));
-                                } else {
-                                    tids.push_back(tid);
-                                    counts[tid]++;
-                                }
+                    uint32_t tid = terms.lookup(h);
+                    if (tid != UINT32_MAX) {
+                        if (last_seen_doc[tid] != doc_id) {
+                            last_seen_doc[tid] = doc_id;
+                            uint32_t hid = hot_id[tid];
+                            if (hid != UINT32_MAX) {
+                                hot_bitsets[(size_t)hid * num_words + (doc_id / 64)] |= (1ULL << (doc_id % 64));
+                            } else {
+                                counts[tid]++;
                             }
                         }
                     }
-
-                    doc_text_off[doc_id] = (uint32_t)(text_start - ddata);
-                    doc_text_len[doc_id] = (uint16_t)(ptr - text_start);
-                    if (ptr < end && *ptr == '\n') ptr++;
                 }
-                doc_start[num_d] = (uint32_t)tids.size();
-            });
-        }
-        for (auto& w : workers) w.join();
-        workers.clear();
+                if (ptr < end && *ptr == '\n') ptr++;
+            }
+        });
 
         // Prefix sum for Block b
         auto& head_b = block_postings_head[b];
@@ -496,7 +506,6 @@ int main(int argc, char** argv) {
         }
         head_b[num_terms] = block_total;
 
-        std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_terms, 0));
         for (uint32_t tid = 0; tid < num_terms; ++tid) {
             if (hot_id[tid] == UINT32_MAX) {
                 uint32_t cur = head_b[tid];
@@ -506,38 +515,61 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        std::vector<std::vector<uint32_t>>().swap(thread_counts);
 
-        // Allocate uint16_t postings buffer for Block b (~5.4 MB)
+        // Allocate uint16_t postings buffer for Block b (~6.6 MB)
         block_postings_data[b].resize(block_total);
         auto& data_b = block_postings_data[b];
 
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                uint32_t d_start = b_thread_d_start[t];
-                uint32_t d_end = b_thread_d_start[t + 1];
-                auto& offsets = thread_write_offsets[t];
-                const auto& tids = thread_tids[t];
-                const auto& doc_start = thread_doc_start[t];
-                uint32_t base = block_d_start[b];
+        // PASS 2 for Block b: Write directly into block_postings_data[b] & record doc_text_off / len
+        ThreadRunner::run(num_threads, [&](unsigned int t) {
+            uint32_t d_start = b_thread_d_start[t];
+            uint32_t d_end = b_thread_d_start[t + 1];
+            auto& offsets = thread_write_offsets[t];
+            std::vector<uint32_t> last_seen_doc(num_terms, UINT32_MAX);
 
-                for (uint32_t doc_id = d_start; doc_id < d_end; ++doc_id) {
-                    uint32_t s_idx = doc_start[doc_id - d_start];
-                    uint32_t e_idx = doc_start[doc_id - d_start + 1];
-                    uint16_t local_d = (uint16_t)(doc_id - base);
-                    for (uint32_t i = s_idx; i < e_idx; ++i) {
-                        uint32_t tid = tids[i];
-                        uint32_t pos = offsets[tid]++;
-                        data_b[pos] = local_d;
+            const char* ptr = b_thread_chunk_starts[t];
+            const char* end = b_thread_chunk_starts[t + 1];
+            uint32_t base = block_d_start[b];
+
+            for (uint32_t doc_id = d_start; doc_id < d_end; ++doc_id) {
+                while (ptr < end && *ptr != '\t') ptr++;
+                if (ptr < end) ptr++;
+                const char* text_start = ptr;
+
+                while (ptr < end && *ptr != '\n') {
+                    while (ptr < end && *ptr != '\n' && CHAR_MAP[(uint8_t)*ptr] == 0) ptr++;
+                    if (ptr >= end || *ptr == '\n') break;
+
+                    uint64_t h = 14695981039346656037ULL;
+                    while (ptr < end) {
+                        uint8_t lc = CHAR_MAP[(uint8_t)*ptr];
+                        if (lc == 0) break;
+                        h = (h ^ lc) * 1099511628211ULL;
+                        ptr++;
+                    }
+
+                    uint32_t q_bit = (uint32_t)h & 0xFFFFF;
+                    if ((QUERY_TERM_FILTER[q_bit >> 6] & (1ULL << (q_bit & 63))) == 0) continue;
+
+                    uint32_t tid = terms.lookup(h);
+                    if (tid != UINT32_MAX && hot_id[tid] == UINT32_MAX) {
+                        if (last_seen_doc[tid] != doc_id) {
+                            last_seen_doc[tid] = doc_id;
+                            uint16_t local_d = (uint16_t)(doc_id - base);
+                            data_b[offsets[tid]++] = local_d;
+                        }
                     }
                 }
-                std::vector<uint32_t>().swap(thread_tids[t]);
-                std::vector<uint32_t>().swap(thread_doc_start[t]);
-            });
-        }
-        for (auto& w : workers) w.join();
-        workers.clear();
+
+                doc_text_off[doc_id] = (uint32_t)(text_start - ddata);
+                doc_text_len[doc_id] = (uint16_t)(ptr - text_start);
+                if (ptr < end && *ptr == '\n') ptr++;
+            }
+        });
     }
+    // Free intermediate offsets
+    std::vector<std::vector<uint16_t>>().swap(thread_counts);
+    std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
 
     // Fast seed-anchored phrase verification
     auto seed_phrase_match = [&](uint32_t doc_id, const std::string_view* p_views, size_t k, size_t seed_idx) -> bool {
@@ -637,256 +669,105 @@ int main(int argc, char** argv) {
     size_t num_queries = queries.size();
     std::vector<std::string> thread_outputs(num_threads);
 
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            size_t q_start = (num_queries * t) / num_threads;
-            size_t q_end = (num_queries * (t + 1)) / num_threads;
-            auto& out_str = thread_outputs[t];
-            out_str.reserve((q_end - q_start) * 40);
+    ThreadRunner::run(num_threads, [&](unsigned int t) {
+        size_t q_start = (num_queries * t) / num_threads;
+        size_t q_end = (num_queries * (t + 1)) / num_threads;
+        auto& out_str = thread_outputs[t];
+        out_str.reserve((q_end - q_start) * 40);
 
-            std::vector<uint64_t> bitset_cur(num_words);
-            std::vector<uint64_t> bitset_tmp(num_words, 0);
-            char line_buf[256];
+        std::vector<uint64_t> bitset_cur(num_words);
+        std::vector<uint64_t> bitset_tmp(num_words, 0);
+        char line_buf[256];
 
-            for (size_t qi = q_start; qi < q_end; ++qi) {
-                const auto& q = queries[qi];
-                if (q.type == QueryType::BOOL) {
-                    const auto& bq = q.bq;
-                    uint32_t t0 = bq.term_ids[0];
-                    uint32_t hid0 = hot_id[t0];
+        for (size_t qi = q_start; qi < q_end; ++qi) {
+            const auto& q = queries[qi];
+            if (q.type == QueryType::BOOL) {
+                const auto& bq = q.bq;
+                uint32_t t0 = bq.term_ids[0];
+                uint32_t hid0 = hot_id[t0];
 
-                    // Check total df0 across blocks
-                    uint32_t total_df0 = 0;
-                    if (hid0 == UINT32_MAX) {
-                        for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                            total_df0 += (block_postings_head[b][t0 + 1] - block_postings_head[b][t0]);
-                        }
+                uint32_t total_df0 = 0;
+                if (hid0 == UINT32_MAX) {
+                    for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                        total_df0 += (block_postings_head[b][t0 + 1] - block_postings_head[b][t0]);
                     }
+                }
 
-                    // FAST PATH: Hybrid Sparse-Doc Evaluation across 4 blocks
-                    if (!bq.has_or && hid0 == UINT32_MAX && total_df0 <= 1024) {
-                        uint64_t total_cnt = 0;
-                        uint64_t total_sum = 0;
-                        uint32_t top10[10];
-                        uint32_t top_cnt = 0;
-
-                        for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                            uint32_t p0_start = block_postings_head[b][t0];
-                            uint32_t p0_end = block_postings_head[b][t0 + 1];
-                            uint32_t df0_b = p0_end - p0_start;
-                            if (df0_b == 0) continue;
-
-                            uint16_t cur_local[1024];
-                            uint32_t cur_cnt = df0_b;
-                            std::memcpy(cur_local, block_postings_data[b].data() + p0_start, df0_b * sizeof(uint16_t));
-                            uint32_t base = block_d_start[b];
-
-                            for (size_t op_i = 0; op_i < bq.ops.size() && cur_cnt > 0; ++op_i) {
-                                BoolOp op = bq.ops[op_i];
-                                uint32_t term_id = bq.term_ids[op_i + 1];
-                                uint32_t hid = hot_id[term_id];
-
-                                uint32_t new_cnt = 0;
-                                if (hid != UINT32_MAX) {
-                                    const uint64_t* bptr = hot_bitsets.data() + (size_t)hid * num_words;
-                                    if (op == BoolOp::AND) {
-                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
-                                            uint32_t d = base + cur_local[i];
-                                            if ((bptr[d / 64] >> (d % 64)) & 1) cur_local[new_cnt++] = cur_local[i];
-                                        }
-                                    } else { // NOT
-                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
-                                            uint32_t d = base + cur_local[i];
-                                            if (!((bptr[d / 64] >> (d % 64)) & 1)) cur_local[new_cnt++] = cur_local[i];
-                                        }
-                                    }
-                                } else {
-                                    uint32_t pstart = block_postings_head[b][term_id];
-                                    uint32_t pend = block_postings_head[b][term_id + 1];
-                                    const uint16_t* pdata = block_postings_data[b].data();
-                                    if (op == BoolOp::AND) {
-                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
-                                            if (std::binary_search(pdata + pstart, pdata + pend, cur_local[i])) {
-                                                cur_local[new_cnt++] = cur_local[i];
-                                            }
-                                        }
-                                    } else { // NOT
-                                        for (uint32_t i = 0; i < cur_cnt; ++i) {
-                                            if (!std::binary_search(pdata + pstart, pdata + pend, cur_local[i])) {
-                                                cur_local[new_cnt++] = cur_local[i];
-                                            }
-                                        }
-                                    }
-                                }
-                                cur_cnt = new_cnt;
-                            }
-
-                            if (cur_cnt > 0) {
-                                total_cnt += cur_cnt;
-                                for (uint32_t i = 0; i < cur_cnt; ++i) {
-                                    uint32_t d = base + cur_local[i];
-                                    total_sum += d;
-                                    if (top_cnt < 10) top10[top_cnt++] = d;
-                                }
-                            }
-                        }
-
-                        if (total_cnt == 0) {
-                            out_str.append("0 0\n");
-                        } else {
-                            char* p = line_buf;
-                            p = u64_to_str(p, total_cnt);
-                            *p++ = ' ';
-                            p = u64_to_str(p, total_sum);
-                            for (uint32_t i = 0; i < top_cnt; ++i) {
-                                *p++ = ' ';
-                                p = u64_to_str(p, top10[i]);
-                            }
-                            *p++ = '\n';
-                            out_str.append(line_buf, p - line_buf);
-                        }
-                        continue;
-                    }
-
-                    // Dense bitset evaluation
-                    bool is_cur_zero = false;
-                    if (hid0 != UINT32_MAX) {
-                        std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid0 * num_words, num_words * sizeof(uint64_t));
-                    } else {
-                        if (total_df0 == 0) {
-                            is_cur_zero = true;
-                        } else {
-                            std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
-                            for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                                uint32_t pstart = block_postings_head[b][t0];
-                                uint32_t pend = block_postings_head[b][t0 + 1];
-                                uint32_t base = block_d_start[b];
-                                const uint16_t* pdata = block_postings_data[b].data();
-                                for (uint32_t i = pstart; i < pend; ++i) {
-                                    uint32_t d = base + pdata[i];
-                                    bitset_cur[d / 64] |= (1ULL << (d % 64));
-                                }
-                            }
-                        }
-                    }
-
-                    if (is_cur_zero && !bq.has_or) {
-                        out_str.append("0 0\n");
-                        continue;
-                    }
-
-                    for (size_t op_i = 0; op_i < bq.ops.size(); ++op_i) {
-                        BoolOp op = bq.ops[op_i];
-                        uint32_t term_id = bq.term_ids[op_i + 1];
-
-                        if (is_cur_zero) {
-                            if (op == BoolOp::AND || op == BoolOp::NOT) {
-                                continue;
-                            } else {
-                                uint32_t hid = hot_id[term_id];
-                                if (hid != UINT32_MAX) {
-                                    std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid * num_words, num_words * sizeof(uint64_t));
-                                    is_cur_zero = false;
-                                } else {
-                                    std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
-                                    for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                                        uint32_t pstart = block_postings_head[b][term_id];
-                                        uint32_t pend = block_postings_head[b][term_id + 1];
-                                        uint32_t base = block_d_start[b];
-                                        const uint16_t* pdata = block_postings_data[b].data();
-                                        for (uint32_t i = pstart; i < pend; ++i) {
-                                            uint32_t d = base + pdata[i];
-                                            bitset_cur[d / 64] |= (1ULL << (d % 64));
-                                        }
-                                    }
-                                    is_cur_zero = false;
-                                }
-                                continue;
-                            }
-                        }
-
-                        uint32_t hid = hot_id[term_id];
-                        const uint64_t* term_bits = nullptr;
-
-                        if (hid != UINT32_MAX) {
-                            term_bits = hot_bitsets.data() + (size_t)hid * num_words;
-                        } else {
-                            for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                                uint32_t pstart = block_postings_head[b][term_id];
-                                uint32_t pend = block_postings_head[b][term_id + 1];
-                                uint32_t base = block_d_start[b];
-                                const uint16_t* pdata = block_postings_data[b].data();
-                                for (uint32_t i = pstart; i < pend; ++i) {
-                                    uint32_t d = base + pdata[i];
-                                    bitset_tmp[d / 64] |= (1ULL << (d % 64));
-                                }
-                            }
-                            term_bits = bitset_tmp.data();
-                        }
-
-                        if (op == BoolOp::AND) {
-                            is_cur_zero = bitset_and(bitset_cur.data(), term_bits, num_words);
-                        } else if (op == BoolOp::OR) {
-                            bitset_or(bitset_cur.data(), term_bits, num_words);
-                        } else if (op == BoolOp::NOT) {
-                            is_cur_zero = bitset_andnot(bitset_cur.data(), term_bits, num_words);
-                        }
-
-                        if (hid == UINT32_MAX) {
-                            for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                                uint32_t pstart = block_postings_head[b][term_id];
-                                uint32_t pend = block_postings_head[b][term_id + 1];
-                                uint32_t base = block_d_start[b];
-                                const uint16_t* pdata = block_postings_data[b].data();
-                                for (uint32_t i = pstart; i < pend; ++i) {
-                                    bitset_tmp[(base + pdata[i]) / 64] = 0;
-                                }
-                            }
-                        }
-
-                        if (is_cur_zero) {
-                            bool has_rem_or = false;
-                            for (size_t j = op_i + 1; j < bq.ops.size(); ++j) {
-                                if (bq.ops[j] == BoolOp::OR) { has_rem_or = true; break; }
-                            }
-                            if (!has_rem_or) break;
-                        }
-                    }
-
-                    if (is_cur_zero) {
-                        out_str.append("0 0\n");
-                        continue;
-                    }
-
-                    uint64_t count = 0;
-                    uint64_t sum = 0;
+                // FAST PATH: Hybrid Sparse-Doc Evaluation across 4 blocks
+                if (!bq.has_or && hid0 == UINT32_MAX && total_df0 <= 1024) {
+                    uint64_t total_cnt = 0;
+                    uint64_t total_sum = 0;
                     uint32_t top10[10];
                     uint32_t top_cnt = 0;
 
-                    for (uint32_t w = 0; w < num_words; ++w) {
-                        uint64_t word = bitset_cur[w];
-                        if (word == 0) continue;
-                        uint32_t pc = __builtin_popcountll(word);
-                        count += pc;
-                        uint32_t base_id = w * 64;
-                        sum += (uint64_t)pc * base_id + u64_bits_sum(word);
-                        if (top_cnt < 10) {
-                            uint64_t tw = word;
-                            while (tw != 0 && top_cnt < 10) {
-                                uint32_t bit = __builtin_ctzll(tw);
-                                top10[top_cnt++] = base_id + bit;
-                                tw &= (tw - 1);
+                    for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                        uint32_t p0_start = block_postings_head[b][t0];
+                        uint32_t p0_end = block_postings_head[b][t0 + 1];
+                        uint32_t df0_b = p0_end - p0_start;
+                        if (df0_b == 0) continue;
+
+                        uint16_t cur_local[1024];
+                        uint32_t cur_cnt = df0_b;
+                        std::memcpy(cur_local, block_postings_data[b].data() + p0_start, df0_b * sizeof(uint16_t));
+                        uint32_t base = block_d_start[b];
+
+                        for (size_t op_i = 0; op_i < bq.ops.size() && cur_cnt > 0; ++op_i) {
+                            BoolOp op = bq.ops[op_i];
+                            uint32_t term_id = bq.term_ids[op_i + 1];
+                            uint32_t hid = hot_id[term_id];
+
+                            uint32_t new_cnt = 0;
+                            if (hid != UINT32_MAX) {
+                                const uint64_t* bptr = hot_bitsets.data() + (size_t)hid * num_words;
+                                if (op == BoolOp::AND) {
+                                    for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                        uint32_t d = base + cur_local[i];
+                                        if ((bptr[d / 64] >> (d % 64)) & 1) cur_local[new_cnt++] = cur_local[i];
+                                    }
+                                } else { // NOT
+                                    for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                        uint32_t d = base + cur_local[i];
+                                        if (!((bptr[d / 64] >> (d % 64)) & 1)) cur_local[new_cnt++] = cur_local[i];
+                                    }
+                                }
+                            } else {
+                                uint32_t pstart = block_postings_head[b][term_id];
+                                uint32_t pend = block_postings_head[b][term_id + 1];
+                                const uint16_t* pdata = block_postings_data[b].data();
+                                if (op == BoolOp::AND) {
+                                    for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                        if (std::binary_search(pdata + pstart, pdata + pend, cur_local[i])) {
+                                            cur_local[new_cnt++] = cur_local[i];
+                                        }
+                                    }
+                                } else { // NOT
+                                    for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                        if (!std::binary_search(pdata + pstart, pdata + pend, cur_local[i])) {
+                                            cur_local[new_cnt++] = cur_local[i];
+                                        }
+                                    }
+                                }
+                            }
+                            cur_cnt = new_cnt;
+                        }
+
+                        if (cur_cnt > 0) {
+                            total_cnt += cur_cnt;
+                            for (uint32_t i = 0; i < cur_cnt; ++i) {
+                                uint32_t d = base + cur_local[i];
+                                total_sum += d;
+                                if (top_cnt < 10) top10[top_cnt++] = d;
                             }
                         }
                     }
 
-                    if (count == 0) {
+                    if (total_cnt == 0) {
                         out_str.append("0 0\n");
                     } else {
                         char* p = line_buf;
-                        p = u64_to_str(p, count);
+                        p = u64_to_str(p, total_cnt);
                         *p++ = ' ';
-                        p = u64_to_str(p, sum);
+                        p = u64_to_str(p, total_sum);
                         for (uint32_t i = 0; i < top_cnt; ++i) {
                             *p++ = ' ';
                             p = u64_to_str(p, top10[i]);
@@ -894,139 +775,285 @@ int main(int argc, char** argv) {
                         *p++ = '\n';
                         out_str.append(line_buf, p - line_buf);
                     }
+                    continue;
+                }
+
+                // Dense bitset evaluation
+                bool is_cur_zero = false;
+                if (hid0 != UINT32_MAX) {
+                    std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid0 * num_words, num_words * sizeof(uint64_t));
                 } else {
-                    // PHRASE query
-                    const auto& pq = q.pq;
-                    size_t k = pq.term_ids.size();
-                    std::string_view p_views[8];
-                    for (size_t j = 0; j < k; ++j) {
-                        p_views[j] = get_term_view(pq.term_ids[j]);
-                    }
-
-                    bool all_hot = true;
-                    for (uint32_t tid : pq.term_ids) {
-                        if (hot_id[tid] == UINT32_MAX) {
-                            all_hot = false;
-                            break;
-                        }
-                    }
-
-                    std::vector<uint32_t> candidates;
-                    size_t seed_idx = 0;
-
-                    if (all_hot) {
-                        uint32_t hid0 = hot_id[pq.term_ids[0]];
-                        std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid0 * num_words, num_words * sizeof(uint64_t));
-                        for (size_t i = 1; i < pq.term_ids.size(); ++i) {
-                            uint32_t hidi = hot_id[pq.term_ids[i]];
-                            bitset_and(bitset_cur.data(), hot_bitsets.data() + (size_t)hidi * num_words, num_words);
-                        }
-                        for (uint32_t w = 0; w < num_words; ++w) {
-                            uint64_t word = bitset_cur[w];
-                            while (word != 0) {
-                                uint32_t bit = __builtin_ctzll(word);
-                                candidates.push_back(w * 64 + bit);
-                                word &= (word - 1);
-                            }
-                        }
-                        seed_idx = 0;
+                    if (total_df0 == 0) {
+                        is_cur_zero = true;
                     } else {
-                        size_t min_idx = SIZE_MAX;
-                        uint32_t min_size = UINT32_MAX;
-                        for (size_t i = 0; i < pq.term_ids.size(); ++i) {
-                            uint32_t tid = pq.term_ids[i];
-                            if (hot_id[tid] == UINT32_MAX) {
-                                uint32_t sz = 0;
-                                for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                                    sz += (block_postings_head[b][tid + 1] - block_postings_head[b][tid]);
-                                }
-                                if (sz < min_size) {
-                                    min_size = sz;
-                                    min_idx = i;
-                                }
-                            }
-                        }
-
-                        seed_idx = min_idx;
-                        uint32_t hot_check_hids[8];
-                        uint32_t hot_check_cnt = 0;
-                        uint32_t non_hot_tids[8];
-                        uint32_t non_hot_cnt = 0;
-
-                        for (size_t i = 0; i < pq.term_ids.size(); ++i) {
-                            if (i == min_idx) continue;
-                            uint32_t tid = pq.term_ids[i];
-                            uint32_t hid = hot_id[tid];
-                            if (hid != UINT32_MAX) {
-                                hot_check_hids[hot_check_cnt++] = hid;
-                            } else {
-                                non_hot_tids[non_hot_cnt++] = tid;
-                            }
-                        }
-
+                        std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
                         for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
-                            uint32_t seed_start = block_postings_head[b][pq.term_ids[min_idx]];
-                            uint32_t seed_end = block_postings_head[b][pq.term_ids[min_idx] + 1];
+                            uint32_t pstart = block_postings_head[b][t0];
+                            uint32_t pend = block_postings_head[b][t0 + 1];
                             uint32_t base = block_d_start[b];
                             const uint16_t* pdata = block_postings_data[b].data();
+                            for (uint32_t i = pstart; i < pend; ++i) {
+                                uint32_t d = base + pdata[i];
+                                bitset_cur[d / 64] |= (1ULL << (d % 64));
+                            }
+                        }
+                    }
+                }
 
-                            for (uint32_t idx = seed_start; idx < seed_end; ++idx) {
-                                uint16_t local_d = pdata[idx];
-                                uint32_t d = base + local_d;
-                                bool has_all = true;
-                                for (uint32_t i = 0; i < hot_check_cnt; ++i) {
-                                    const uint64_t* bptr = hot_bitsets.data() + (size_t)hot_check_hids[i] * num_words;
-                                    if (!((bptr[d / 64] >> (d % 64)) & 1)) {
-                                        has_all = false;
-                                        break;
+                if (is_cur_zero && !bq.has_or) {
+                    out_str.append("0 0\n");
+                    continue;
+                }
+
+                for (size_t op_i = 0; op_i < bq.ops.size(); ++op_i) {
+                    BoolOp op = bq.ops[op_i];
+                    uint32_t term_id = bq.term_ids[op_i + 1];
+
+                    if (is_cur_zero) {
+                        if (op == BoolOp::AND || op == BoolOp::NOT) {
+                            continue;
+                        } else {
+                            uint32_t hid = hot_id[term_id];
+                            if (hid != UINT32_MAX) {
+                                std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid * num_words, num_words * sizeof(uint64_t));
+                                is_cur_zero = false;
+                            } else {
+                                std::memset(bitset_cur.data(), 0, num_words * sizeof(uint64_t));
+                                for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                                    uint32_t pstart = block_postings_head[b][term_id];
+                                    uint32_t pend = block_postings_head[b][term_id + 1];
+                                    uint32_t base = block_d_start[b];
+                                    const uint16_t* pdata = block_postings_data[b].data();
+                                    for (uint32_t i = pstart; i < pend; ++i) {
+                                        uint32_t d = base + pdata[i];
+                                        bitset_cur[d / 64] |= (1ULL << (d % 64));
                                     }
                                 }
-                                if (!has_all) continue;
-                                for (uint32_t i = 0; i < non_hot_cnt; ++i) {
-                                    uint32_t tid = non_hot_tids[i];
-                                    uint32_t pstart = block_postings_head[b][tid];
-                                    uint32_t pend = block_postings_head[b][tid + 1];
-                                    if (!std::binary_search(pdata + pstart, pdata + pend, local_d)) {
-                                        has_all = false;
-                                        break;
-                                    }
-                                }
-                                if (has_all) candidates.push_back(d);
+                                is_cur_zero = false;
+                            }
+                            continue;
+                        }
+                    }
+
+                    uint32_t hid = hot_id[term_id];
+                    const uint64_t* term_bits = nullptr;
+
+                    if (hid != UINT32_MAX) {
+                        term_bits = hot_bitsets.data() + (size_t)hid * num_words;
+                    } else {
+                        for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                            uint32_t pstart = block_postings_head[b][term_id];
+                            uint32_t pend = block_postings_head[b][term_id + 1];
+                            uint32_t base = block_d_start[b];
+                            const uint16_t* pdata = block_postings_data[b].data();
+                            for (uint32_t i = pstart; i < pend; ++i) {
+                                uint32_t d = base + pdata[i];
+                                bitset_tmp[d / 64] |= (1ULL << (d % 64));
+                            }
+                        }
+                        term_bits = bitset_tmp.data();
+                    }
+
+                    if (op == BoolOp::AND) {
+                        is_cur_zero = bitset_and(bitset_cur.data(), term_bits, num_words);
+                    } else if (op == BoolOp::OR) {
+                        bitset_or(bitset_cur.data(), term_bits, num_words);
+                    } else if (op == BoolOp::NOT) {
+                        is_cur_zero = bitset_andnot(bitset_cur.data(), term_bits, num_words);
+                    }
+
+                    if (hid == UINT32_MAX) {
+                        for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                            uint32_t pstart = block_postings_head[b][term_id];
+                            uint32_t pend = block_postings_head[b][term_id + 1];
+                            uint32_t base = block_d_start[b];
+                            const uint16_t* pdata = block_postings_data[b].data();
+                            for (uint32_t i = pstart; i < pend; ++i) {
+                                bitset_tmp[(base + pdata[i]) / 64] = 0;
                             }
                         }
                     }
 
-                    std::vector<uint32_t> matches;
-                    for (uint32_t d : candidates) {
-                        if (seed_phrase_match(d, p_views, k, seed_idx)) {
-                            matches.push_back(d);
+                    if (is_cur_zero) {
+                        bool has_rem_or = false;
+                        for (size_t j = op_i + 1; j < bq.ops.size(); ++j) {
+                            if (bq.ops[j] == BoolOp::OR) { has_rem_or = true; break; }
+                        }
+                        if (!has_rem_or) break;
+                    }
+                }
+
+                if (is_cur_zero) {
+                    out_str.append("0 0\n");
+                    continue;
+                }
+
+                uint64_t count = 0;
+                uint64_t sum = 0;
+                uint32_t top10[10];
+                uint32_t top_cnt = 0;
+
+                for (uint32_t w = 0; w < num_words; ++w) {
+                    uint64_t word = bitset_cur[w];
+                    if (word == 0) continue;
+                    uint32_t pc = __builtin_popcountll(word);
+                    count += pc;
+                    uint32_t base_id = w * 64;
+                    sum += (uint64_t)pc * base_id + u64_bits_sum(word);
+                    if (top_cnt < 10) {
+                        uint64_t tw = word;
+                        while (tw != 0 && top_cnt < 10) {
+                            uint32_t bit = __builtin_ctzll(tw);
+                            top10[top_cnt++] = base_id + bit;
+                            tw &= (tw - 1);
+                        }
+                    }
+                }
+
+                if (count == 0) {
+                    out_str.append("0 0\n");
+                } else {
+                    char* p = line_buf;
+                    p = u64_to_str(p, count);
+                    *p++ = ' ';
+                    p = u64_to_str(p, sum);
+                    for (uint32_t i = 0; i < top_cnt; ++i) {
+                        *p++ = ' ';
+                        p = u64_to_str(p, top10[i]);
+                    }
+                    *p++ = '\n';
+                    out_str.append(line_buf, p - line_buf);
+                }
+            } else {
+                // PHRASE query
+                const auto& pq = q.pq;
+                size_t k = pq.term_ids.size();
+                std::string_view p_views[8];
+                for (size_t j = 0; j < k; ++j) {
+                    p_views[j] = get_term_view(pq.term_ids[j]);
+                }
+
+                bool all_hot = true;
+                for (uint32_t tid : pq.term_ids) {
+                    if (hot_id[tid] == UINT32_MAX) {
+                        all_hot = false;
+                        break;
+                    }
+                }
+
+                std::vector<uint32_t> candidates;
+                size_t seed_idx = 0;
+
+                if (all_hot) {
+                    uint32_t hid0 = hot_id[pq.term_ids[0]];
+                    std::memcpy(bitset_cur.data(), hot_bitsets.data() + (size_t)hid0 * num_words, num_words * sizeof(uint64_t));
+                    for (size_t i = 1; i < pq.term_ids.size(); ++i) {
+                        uint32_t hidi = hot_id[pq.term_ids[i]];
+                        bitset_and(bitset_cur.data(), hot_bitsets.data() + (size_t)hidi * num_words, num_words);
+                    }
+                    for (uint32_t w = 0; w < num_words; ++w) {
+                        uint64_t word = bitset_cur[w];
+                        while (word != 0) {
+                            uint32_t bit = __builtin_ctzll(word);
+                            candidates.push_back(w * 64 + bit);
+                            word &= (word - 1);
+                        }
+                    }
+                    seed_idx = 0;
+                } else {
+                    size_t min_idx = SIZE_MAX;
+                    uint32_t min_size = UINT32_MAX;
+                    for (size_t i = 0; i < pq.term_ids.size(); ++i) {
+                        uint32_t tid = pq.term_ids[i];
+                        if (hot_id[tid] == UINT32_MAX) {
+                            uint32_t sz = 0;
+                            for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                                sz += (block_postings_head[b][tid + 1] - block_postings_head[b][tid]);
+                            }
+                            if (sz < min_size) {
+                                min_size = sz;
+                                min_idx = i;
+                            }
                         }
                     }
 
-                    if (matches.empty()) {
-                        out_str.append("0 0\n");
-                    } else {
-                        uint64_t count = matches.size();
-                        uint64_t sum = 0;
-                        for (uint32_t d : matches) sum += d;
-                        char* p = line_buf;
-                        p = u64_to_str(p, count);
-                        *p++ = ' ';
-                        p = u64_to_str(p, sum);
-                        size_t print_cnt = std::min((size_t)10, (size_t)count);
-                        for (size_t i = 0; i < print_cnt; ++i) {
-                            *p++ = ' ';
-                            p = u64_to_str(p, matches[i]);
+                    seed_idx = min_idx;
+                    uint32_t hot_check_hids[8];
+                    uint32_t hot_check_cnt = 0;
+                    uint32_t non_hot_tids[8];
+                    uint32_t non_hot_cnt = 0;
+
+                    for (size_t i = 0; i < pq.term_ids.size(); ++i) {
+                        if (i == min_idx) continue;
+                        uint32_t tid = pq.term_ids[i];
+                        uint32_t hid = hot_id[tid];
+                        if (hid != UINT32_MAX) {
+                            hot_check_hids[hot_check_cnt++] = hid;
+                        } else {
+                            non_hot_tids[non_hot_cnt++] = tid;
                         }
-                        *p++ = '\n';
-                        out_str.append(line_buf, p - line_buf);
+                    }
+
+                    for (uint32_t b = 0; b < NUM_BLOCKS; ++b) {
+                        uint32_t seed_start = block_postings_head[b][pq.term_ids[min_idx]];
+                        uint32_t seed_end = block_postings_head[b][pq.term_ids[min_idx] + 1];
+                        uint32_t base = block_d_start[b];
+                        const uint16_t* pdata = block_postings_data[b].data();
+
+                        for (uint32_t idx = seed_start; idx < seed_end; ++idx) {
+                            uint16_t local_d = pdata[idx];
+                            uint32_t d = base + local_d;
+                            bool has_all = true;
+                            for (uint32_t i = 0; i < hot_check_cnt; ++i) {
+                                const uint64_t* bptr = hot_bitsets.data() + (size_t)hot_check_hids[i] * num_words;
+                                if (!((bptr[d / 64] >> (d % 64)) & 1)) {
+                                    has_all = false;
+                                    break;
+                                }
+                            }
+                            if (!has_all) continue;
+                            for (uint32_t i = 0; i < non_hot_cnt; ++i) {
+                                uint32_t tid = non_hot_tids[i];
+                                uint32_t pstart = block_postings_head[b][tid];
+                                uint32_t pend = block_postings_head[b][tid + 1];
+                                if (!std::binary_search(pdata + pstart, pdata + pend, local_d)) {
+                                    has_all = false;
+                                    break;
+                                }
+                            }
+                            if (has_all) candidates.push_back(d);
+                        }
                     }
                 }
+
+                std::vector<uint32_t> matches;
+                for (uint32_t d : candidates) {
+                    if (seed_phrase_match(d, p_views, k, seed_idx)) {
+                        matches.push_back(d);
+                    }
+                }
+
+                if (matches.empty()) {
+                    out_str.append("0 0\n");
+                } else {
+                    uint64_t count = matches.size();
+                    uint64_t sum = 0;
+                    for (uint32_t d : matches) sum += d;
+                    char* p = line_buf;
+                    p = u64_to_str(p, count);
+                    *p++ = ' ';
+                    p = u64_to_str(p, sum);
+                    size_t print_cnt = std::min((size_t)10, (size_t)count);
+                    for (size_t i = 0; i < print_cnt; ++i) {
+                        *p++ = ' ';
+                        p = u64_to_str(p, matches[i]);
+                    }
+                    *p++ = '\n';
+                    out_str.append(line_buf, p - line_buf);
+                }
             }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
+        }
+    });
 
     munmap((void*)ddata, dsize);
 
