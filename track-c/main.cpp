@@ -176,18 +176,12 @@ struct ThreadCountryAgg {
 };
 
 struct ThreadContext {
+    const char* start;
+    const char* end;
     ThreadCountryAgg aggs[NUM_BUCKETS];
 };
 
 static ThreadContext TCONTEXTS[16];
-
-struct ChunkTask {
-    const char* start;
-    const char* end;
-};
-static ChunkTask TASKS[64];
-static uint32_t NUM_TASKS = 0;
-static std::atomic<uint32_t> NEXT_TASK_IDX{0};
 
 inline char* u64_to_str(char* buf, uint64_t val) {
     if (val == 0) { *buf++ = '0'; return buf; }
@@ -223,176 +217,170 @@ inline bool is_record_start(const char* ptr, const char* end) {
 
 void* worker_thread(void* arg) {
     ThreadContext* ctx = (ThreadContext*)arg;
+    const char* ptr = ctx->start;
+    const char* end = ctx->end;
     auto& aggs = ctx->aggs;
     char unescape_buf[64];
 
-    while (true) {
-        uint32_t task_id = NEXT_TASK_IDX.fetch_add(1, std::memory_order_relaxed);
-        if (task_id >= NUM_TASKS) break;
-
-        const char* ptr = TASKS[task_id].start;
-        const char* end = TASKS[task_id].end;
-
-        while (ptr < end) {
-            if (__builtin_expect((uint8_t)*ptr == 0xEF, 0)) {
-                if (ptr + 3 <= end && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) {
-                    ptr += 3;
-                }
+    while (ptr < end) {
+        if (__builtin_expect((uint8_t)*ptr == 0xEF, 0)) {
+            if (ptr + 3 <= end && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) {
+                ptr += 3;
             }
-            if (ptr >= end) break;
+        }
+        if (ptr >= end) break;
 
-            // 1. id
-            uint64_t rec_id = *ptr++ - '0';
-            while (*ptr != ',') {
-                rec_id = rec_id * 10 + (*ptr++ - '0');
-            }
-            ptr++; // skip ','
+        // 1. id
+        uint64_t rec_id = 0;
+        while ((uint8_t)*ptr >= '0') {
+            rec_id = rec_id * 10 + (*ptr++ - '0');
+        }
+        ptr++; // skip ','
 
-            // 2. name
-            uint64_t nhash = 0;
-            uint16_t name_len = 0;
-            if (__builtin_expect(*ptr == '"', 1)) {
-                ptr++;
-                const char* start = ptr;
-                const char* q = find_quote_name(ptr);
-                if (__builtin_expect(*(q + 1) == ',', 1)) {
-                    name_len = (uint16_t)(q - start);
-                    nhash = fast_hash(start, name_len);
-                    ptr = q + 2; // skip '"' and ','
-                } else {
-                    size_t prefix_len = q - start;
-                    std::memcpy(unescape_buf, start, prefix_len);
-                    int ulen = (int)prefix_len;
-                    const char* cur = q;
-                    while (true) {
-                        if (*(cur + 1) == '"') {
-                            unescape_buf[ulen++] = '"';
-                            cur += 2;
-                            const char* nq = find_quote_name(cur);
-                            size_t seg = nq - cur;
-                            std::memcpy(unescape_buf + ulen, cur, seg);
-                            ulen += (int)seg;
-                            cur = nq;
-                        } else {
-                            ptr = cur + 2; // skip '"' and ','
-                            break;
-                        }
-                    }
-                    name_len = (uint16_t)ulen;
-                    nhash = fast_hash(unescape_buf, ulen);
-                }
-            } else {
-                const char* start = ptr;
-                const char* c = find_comma(ptr);
-                name_len = (uint16_t)(c - start);
+        // 2. name
+        uint64_t nhash = 0;
+        uint16_t name_len = 0;
+        if (__builtin_expect(*ptr == '"', 1)) {
+            ptr++;
+            const char* start = ptr;
+            const char* q = find_quote_name(ptr);
+            if (__builtin_expect(*(q + 1) == ',', 1)) {
+                name_len = (uint16_t)(q - start);
                 nhash = fast_hash(start, name_len);
-                ptr = c + 1;
-            }
-
-            if (nhash == 0) nhash = 1;
-            uint32_t slot = (uint32_t)nhash & TABLE_MASK;
-            __builtin_prefetch(&NAME_TABLE[slot], 0, 1);
-
-            // 3. note
-            uint32_t note_bytes = 0;
-            if (__builtin_expect(*ptr == '"', 1)) {
-                ptr++;
-                const char* start = ptr;
-                const char* q = find_quote_note(ptr);
-                if (__builtin_expect(*(q + 1) == ',', 1)) {
-                    note_bytes = (uint32_t)(q - start);
-                    ptr = q + 2;
-                } else {
-                    uint32_t quote_pairs = 0;
-                    while (true) {
-                        if (*(q + 1) == '"') {
-                            quote_pairs++;
-                            q = find_quote_note(q + 2);
-                        } else {
-                            note_bytes = (uint32_t)(q - start) - quote_pairs;
-                            ptr = q + 2; // skip '"' and ','
-                            break;
-                        }
+                ptr = q + 2; // skip '"' and ','
+            } else {
+                size_t prefix_len = q - start;
+                std::memcpy(unescape_buf, start, prefix_len);
+                int ulen = (int)prefix_len;
+                const char* cur = q;
+                while (true) {
+                    if (*(cur + 1) == '"') {
+                        unescape_buf[ulen++] = '"';
+                        cur += 2;
+                        const char* nq = find_quote_name(cur);
+                        size_t seg = nq - cur;
+                        std::memcpy(unescape_buf + ulen, cur, seg);
+                        ulen += (int)seg;
+                        cur = nq;
+                    } else {
+                        ptr = cur + 2; // skip '"' and ','
+                        break;
                     }
                 }
+                name_len = (uint16_t)ulen;
+                nhash = fast_hash(unescape_buf, ulen);
+            }
+        } else {
+            const char* start = ptr;
+            const char* c = find_comma(ptr);
+            name_len = (uint16_t)(c - start);
+            nhash = fast_hash(start, name_len);
+            ptr = c + 1;
+        }
+
+        if (nhash == 0) nhash = 1;
+        uint32_t slot = (uint32_t)nhash & TABLE_MASK;
+        __builtin_prefetch(&NAME_TABLE[slot], 0, 1);
+
+        // 3. note
+        uint32_t note_bytes = 0;
+        if (__builtin_expect(*ptr == '"', 1)) {
+            ptr++;
+            const char* start = ptr;
+            const char* q = find_quote_note(ptr);
+            if (__builtin_expect(*(q + 1) == ',', 1)) {
+                note_bytes = (uint32_t)(q - start);
+                ptr = q + 2;
             } else {
-                const char* start = ptr;
-                const char* c = find_comma(ptr);
-                note_bytes = (uint32_t)(c - start);
-                ptr = c + 1;
-            }
-
-            // 4. region_id
-            uint32_t reg_id = *ptr++ - '0';
-            while (*ptr != ',') {
-                reg_id = reg_id * 10 + (*ptr++ - '0');
-            }
-            ptr++; // skip ','
-
-            uint8_t cid = (reg_id < 1000000) ? REGION_TO_COUNTRY[reg_id] : UNMATCHED_CID;
-            uint32_t word_idx = slot >> 6;
-            __builtin_prefetch(&COUNTRY_BITS[cid][word_idx], 1, 1);
-
-            // 5. amount
-            bool neg = (*ptr == '-');
-            if (neg) ptr++;
-            int64_t cents = *ptr++ - '0';
-            while (*ptr != '.') {
-                cents = cents * 10 + (*ptr++ - '0');
-            }
-            ptr++; // skip '.'
-            cents = cents * 100 + ((uint8_t)ptr[0] * 10 + (uint8_t)ptr[1] - 528);
-            ptr += 2;
-            if (neg) cents = -cents;
-
-            if (ptr < end && *ptr == '\r') ptr++;
-            if (ptr < end && *ptr == '\n') ptr++;
-
-            ThreadCountryAgg& agg = aggs[cid];
-            agg.count++;
-            agg.id_sum += rec_id;
-            agg.amount_sum += cents;
-            agg.amount_min = std::min(agg.amount_min, cents);
-            agg.amount_max = std::max(agg.amount_max, cents);
-            agg.name_bytes += name_len;
-            agg.note_bytes += note_bytes;
-
-            uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
-            if (__builtin_expect(val != nhash, 0)) {
-                if (val == 0) {
-                    uint64_t expected = 0;
-                    if (!NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed) && expected != nhash) {
-                        uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
-                        while (true) {
-                            slot = (slot + step) & TABLE_MASK;
-                            val = NAME_TABLE[slot].load(std::memory_order_relaxed);
-                            if (val == nhash) break;
-                            if (val == 0) {
-                                expected = 0;
-                                if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed) || expected == nhash) break;
-                            }
-                        }
-                        word_idx = slot >> 6;
+                uint32_t quote_pairs = 0;
+                while (true) {
+                    if (*(q + 1) == '"') {
+                        quote_pairs++;
+                        q = find_quote_note(q + 2);
+                    } else {
+                        note_bytes = (uint32_t)(q - start) - quote_pairs;
+                        ptr = q + 2; // skip '"' and ','
+                        break;
                     }
-                } else {
+                }
+            }
+        } else {
+            const char* start = ptr;
+            const char* c = find_comma(ptr);
+            note_bytes = (uint32_t)(c - start);
+            ptr = c + 1;
+        }
+
+        // 4. region_id
+        uint32_t reg_id = 0;
+        while ((uint8_t)*ptr >= '0') {
+            reg_id = reg_id * 10 + (*ptr++ - '0');
+        }
+        ptr++; // skip ','
+
+        uint8_t cid = (reg_id < 1000000) ? REGION_TO_COUNTRY[reg_id] : UNMATCHED_CID;
+        uint32_t word_idx = slot >> 6;
+        __builtin_prefetch(&COUNTRY_BITS[cid][word_idx], 1, 1);
+
+        // 5. amount
+        bool neg = (*ptr == '-');
+        if (neg) ptr++;
+        int64_t cents = *ptr++ - '0';
+        while (*ptr != '.') {
+            cents = cents * 10 + (*ptr++ - '0');
+        }
+        ptr++; // skip '.'
+        cents = cents * 100 + ((uint8_t)ptr[0] * 10 + (uint8_t)ptr[1] - 528);
+        ptr += 2;
+        if (neg) cents = -cents;
+
+        if (ptr < end && *ptr == '\r') ptr++;
+        if (ptr < end && *ptr == '\n') ptr++;
+
+        ThreadCountryAgg& agg = aggs[cid];
+        agg.count++;
+        agg.id_sum += rec_id;
+        agg.amount_sum += cents;
+        agg.amount_min = std::min(agg.amount_min, cents);
+        agg.amount_max = std::max(agg.amount_max, cents);
+        agg.name_bytes += name_len;
+        agg.note_bytes += note_bytes;
+
+        uint64_t val = NAME_TABLE[slot].load(std::memory_order_relaxed);
+        if (__builtin_expect(val != nhash, 0)) {
+            if (val == 0) {
+                uint64_t expected = 0;
+                if (!NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed) && expected != nhash) {
                     uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
                     while (true) {
                         slot = (slot + step) & TABLE_MASK;
                         val = NAME_TABLE[slot].load(std::memory_order_relaxed);
                         if (val == nhash) break;
                         if (val == 0) {
-                            uint64_t expected = 0;
+                            expected = 0;
                             if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed) || expected == nhash) break;
                         }
                     }
                     word_idx = slot >> 6;
                 }
+            } else {
+                uint32_t step = ((uint32_t)(nhash >> 17) | 1) & TABLE_MASK;
+                while (true) {
+                    slot = (slot + step) & TABLE_MASK;
+                    val = NAME_TABLE[slot].load(std::memory_order_relaxed);
+                    if (val == nhash) break;
+                    if (val == 0) {
+                        uint64_t expected = 0;
+                        if (NAME_TABLE[slot].compare_exchange_strong(expected, nhash, std::memory_order_relaxed) || expected == nhash) break;
+                    }
+                }
+                word_idx = slot >> 6;
             }
+        }
 
-            uint64_t bit_mask = 1ULL << (slot & 63);
-            if (__builtin_expect((COUNTRY_BITS[cid][word_idx].load(std::memory_order_relaxed) & bit_mask) == 0, 1)) {
-                COUNTRY_BITS[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
-            }
+        uint64_t bit_mask = 1ULL << (slot & 63);
+        if (__builtin_expect((COUNTRY_BITS[cid][word_idx].load(std::memory_order_relaxed) & bit_mask) == 0, 0)) {
+            COUNTRY_BITS[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
         }
     }
     return nullptr;
@@ -442,8 +430,8 @@ int main(int argc, char** argv) {
 
     while (rptr < rend) {
         if (*rptr == '\r' || *rptr == '\n') { rptr++; continue; }
-        uint32_t reg_id = *rptr++ - '0';
-        while (*rptr != ',') {
+        uint32_t reg_id = 0;
+        while ((uint8_t)*rptr >= '0') {
             reg_id = reg_id * 10 + (*rptr++ - '0');
         }
         rptr++; // skip ','
@@ -489,20 +477,12 @@ int main(int argc, char** argv) {
     }
 
     size_t records_bytes = file_end - file_start;
-
-    // Dynamic work-stealing tasks: ~4.0 MB per chunk (~48 tasks across 193 MB)
-    size_t target_chunk_size = 4000000;
-    size_t num_chunks = records_bytes / target_chunk_size;
-    if (num_chunks < num_threads) num_chunks = num_threads;
-    if (num_chunks > 48) num_chunks = 48;
-    if (num_chunks < 1) num_chunks = 1;
-
-    std::vector<const char*> chunk_starts(num_chunks + 1);
+    std::vector<const char*> chunk_starts(num_threads + 1);
     chunk_starts[0] = file_start;
-    chunk_starts[num_chunks] = file_end;
+    chunk_starts[num_threads] = file_end;
 
-    for (size_t t = 1; t < num_chunks; ++t) {
-        const char* approx = file_start + (records_bytes / num_chunks) * t;
+    for (unsigned int t = 1; t < num_threads; ++t) {
+        const char* approx = file_start + (records_bytes / num_threads) * t;
         while (approx < file_end) {
             if (*approx == '\n') {
                 const char* cand = approx + 1;
@@ -516,19 +496,14 @@ int main(int argc, char** argv) {
         chunk_starts[t] = approx;
     }
 
-    NUM_TASKS = (uint32_t)num_chunks;
-    for (size_t t = 0; t < num_chunks; ++t) {
-        TASKS[t].start = chunk_starts[t];
-        TASKS[t].end = chunk_starts[t + 1];
-    }
-    NEXT_TASK_IDX.store(0, std::memory_order_relaxed);
-
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 65536);
 
     pthread_t threads[16];
     for (unsigned int t = 0; t < num_threads; ++t) {
+        TCONTEXTS[t].start = chunk_starts[t];
+        TCONTEXTS[t].end = chunk_starts[t + 1];
         pthread_create(&threads[t], &attr, worker_thread, &TCONTEXTS[t]);
     }
     pthread_attr_destroy(&attr);

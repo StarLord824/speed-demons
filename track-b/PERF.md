@@ -151,19 +151,15 @@
   - Falkenstein live runner scored: $T = 0.4516\text{ s}$, $M = 61.10\text{ MB}$ (slashed from 83.32 MB, -22.2 MB / -26.7% memory drop), $S = 1100$, $K = 15.739$, **59.849 points** (all 5 gates passed, new all-time personal best).
   - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
-## Step 13: AVX2 2-Char Vectorized Phrase Verification & Direct Zero-Candidate Streaming
+## Step 13: Exploration of 2-Char AVX2 Scanner & Reversion to Optimal dfed2cf Scanner
+- **Run ID**: Commit `18cd5e7`
 - **Hypothesis**:
-  1. Diagnostic profiling revealed that phrase queries spent 823.86 ms of thread CPU time evaluating 214,226 candidates, of which only 19,332 were genuine phrase matches (a 91% false-positive candidate rate). Searching for only the first letter `c0` in candidate text caused millions of false matches on common English words starting with `c0`, repeatedly forcing scalar branch mispredictions and loop resets.
-  2. Searching simultaneously for a 2-character prefix `(c0, c1)` via AVX2 SIMD (`_mm256_loadu_si256`, `_mm256_or_si256` with `0x20` for case-insensitive lowercasing, and `_mm256_and_si256` of equality masks) prunes >99% of false character triggers in 1 instruction.
-  3. Processing all set bits in `mask` via `__builtin_ctz` and `mask &= (mask - 1)` eliminates redundant unaligned loads and restarts.
-  4. Eliminating intermediate `std::vector<uint32_t> candidates` completely: documents satisfying the posting intersection stream directly to `seed_phrase_match`, and successful matches are appended directly into `matches`, avoiding 214k heap pushes, vector re-allocations, and cache evictions.
-- **Implementation**:
-  - Implemented 2-character AVX2 SIMD prefix scanner in `seed_phrase_match` with single-cycle 32-byte case folding (`_mm256_or_si256(chunk, 0x20)`).
-  - Streamed verified candidates directly into `matches`, completely removing the intermediate `candidates` vector.
+  - Attempted to reduce phrase verification time by vectorizing 2-character prefix searches with AVX2 (`_mm256_loadu_si256` of `ptr + 1` and `_mm256_or_si256(chunk, 0x20)`).
 - **Measurement**:
-  - Exact bit-for-bit SHA-256 hash verified: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+  - Live Falkenstein runner measured wall time increase from $0.4517\text{ s}$ to **$0.5903\text{ s}$** due to increased instruction latency and unaligned load penalties on `ptr + 1`.
+  - Reverted `seed_phrase_match` to the proven, fast `avx2_find_char_pair` scanner from commit `dfed2cf`, preserving our personal record of **59.849 points** ($T = 0.4516\text{ s}$, $M = 61.10\text{ MB}$, all gates passing).
   - Clean warning-free compilation with `-std=c++20 -O3 -Wall -Wextra -Werror -march=native -flto -pthread`.
-  - Clean syntax verification for x86_64 AVX2 targets.
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
 
 

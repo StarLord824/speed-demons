@@ -580,87 +580,41 @@ int main(int argc, char** argv) {
         if (doc_end - doc_start < (ptrdiff_t)seed_len) return false;
 
         uint8_t c0 = (uint8_t)seed_w[0];
-        uint8_t c1 = (seed_len > 1) ? (uint8_t)seed_w[1] : 0;
-        const char* scan_end = doc_end - seed_len + 1;
+        uint8_t c0_upper = (c0 >= 'a' && c0 <= 'z') ? (c0 - 32) : c0;
+
         const char* ptr = doc_start;
-
-#if defined(__AVX2__)
-        __m256i v_or = _mm256_set1_epi8(0x20);
-        __m256i v0 = _mm256_set1_epi8(c0);
-        __m256i v1 = (seed_len > 1) ? _mm256_set1_epi8(c1) : _mm256_setzero_si256();
-
-        while (ptr + 33 <= scan_end) {
-            __m256i chunk0 = _mm256_loadu_si256((const __m256i*)ptr);
-            __m256i lower0 = _mm256_or_si256(chunk0, v_or);
-            __m256i eq = _mm256_cmpeq_epi8(lower0, v0);
-            if (seed_len > 1) {
-                __m256i chunk1 = _mm256_loadu_si256((const __m256i*)(ptr + 1));
-                __m256i lower1 = _mm256_or_si256(chunk1, v_or);
-                eq = _mm256_and_si256(eq, _mm256_cmpeq_epi8(lower1, v1));
-            }
-            uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
-            while (mask != 0) {
-                uint32_t bit = __builtin_ctz(mask);
-                const char* match_ptr = ptr + bit;
-                if (match_ptr == doc_start || CHAR_MAP[(uint8_t)*(match_ptr - 1)] == 0) {
-                    bool seed_match = true;
-                    for (size_t b = 2; b < seed_len; ++b) {
-                        if (CHAR_MAP[(uint8_t)match_ptr[b]] != (uint8_t)seed_w[b]) {
-                            seed_match = false;
-                            break;
-                        }
-                    }
-                    if (seed_match && (match_ptr + seed_len == doc_end || CHAR_MAP[(uint8_t)*(match_ptr + seed_len)] == 0)) {
-                        bool phrase_ok = true;
-                        const char* cur = match_ptr + seed_len;
-                        for (size_t j = seed_idx + 1; j < k; ++j) {
-                            while (cur < doc_end && CHAR_MAP[(uint8_t)*cur] == 0) cur++;
-                            size_t wlen = p_views[j].size();
-                            if (cur + wlen > doc_end) { phrase_ok = false; break; }
-                            for (size_t b = 0; b < wlen; ++b) {
-                                if (CHAR_MAP[(uint8_t)cur[b]] != (uint8_t)p_views[j][b]) { phrase_ok = false; break; }
-                            }
-                            if (!phrase_ok) break;
-                            cur += wlen;
-                            if (cur < doc_end && CHAR_MAP[(uint8_t)*cur] != 0) { phrase_ok = false; break; }
-                        }
-                        if (phrase_ok) {
-                            cur = match_ptr;
-                            for (int j = (int)seed_idx - 1; j >= 0; --j) {
-                                while (cur > doc_start && CHAR_MAP[(uint8_t)*(cur - 1)] == 0) cur--;
-                                size_t wlen = p_views[j].size();
-                                if (cur - wlen < doc_start) { phrase_ok = false; break; }
-                                const char* w_start = cur - wlen;
-                                if (w_start > doc_start && CHAR_MAP[(uint8_t)*(w_start - 1)] != 0) { phrase_ok = false; break; }
-                                for (size_t b = 0; b < wlen; ++b) {
-                                    if (CHAR_MAP[(uint8_t)w_start[b]] != (uint8_t)p_views[j][b]) { phrase_ok = false; break; }
-                                }
-                                if (!phrase_ok) break;
-                                cur = w_start;
-                            }
-                            if (phrase_ok) return true;
-                        }
-                    }
-                }
-                mask &= (mask - 1);
-            }
-            ptr += 32;
-        }
-#endif
+        const char* scan_end = doc_end - seed_len + 1;
 
         while (ptr < scan_end) {
-            if (CHAR_MAP[(uint8_t)*ptr] != c0) { ptr++; continue; }
-            if (seed_len > 1 && CHAR_MAP[(uint8_t)ptr[1]] != c1) { ptr++; continue; }
-            if (ptr > doc_start && CHAR_MAP[(uint8_t)*(ptr - 1)] != 0) { ptr++; continue; }
+#if defined(__AVX2__)
+            ptr = avx2_find_char_pair(ptr, scan_end, c0, c0_upper);
+            if (ptr >= scan_end) break;
+#else
+            uint8_t c = (uint8_t)*ptr;
+            if (c != c0 && c != c0_upper) {
+                ptr++;
+                continue;
+            }
+#endif
+
+            if (ptr > doc_start && CHAR_MAP[(uint8_t)*(ptr - 1)] != 0) {
+                ptr++;
+                continue;
+            }
 
             bool seed_match = true;
-            for (size_t b = 2; b < seed_len; ++b) {
+            for (size_t b = 1; b < seed_len; ++b) {
                 if (CHAR_MAP[(uint8_t)ptr[b]] != (uint8_t)seed_w[b]) {
                     seed_match = false;
                     break;
                 }
             }
-            if (!seed_match || (ptr + seed_len < doc_end && CHAR_MAP[(uint8_t)*(ptr + seed_len)] != 0)) {
+            if (!seed_match) {
+                ptr++;
+                continue;
+            }
+
+            if (ptr + seed_len < doc_end && CHAR_MAP[(uint8_t)*(ptr + seed_len)] != 0) {
                 ptr++;
                 continue;
             }
@@ -672,30 +626,42 @@ int main(int argc, char** argv) {
                 size_t wlen = p_views[j].size();
                 if (cur + wlen > doc_end) { phrase_ok = false; break; }
                 for (size_t b = 0; b < wlen; ++b) {
-                    if (CHAR_MAP[(uint8_t)cur[b]] != (uint8_t)p_views[j][b]) { phrase_ok = false; break; }
+                    if (CHAR_MAP[(uint8_t)cur[b]] != (uint8_t)p_views[j][b]) {
+                        phrase_ok = false;
+                        break;
+                    }
                 }
                 if (!phrase_ok) break;
                 cur += wlen;
                 if (cur < doc_end && CHAR_MAP[(uint8_t)*cur] != 0) { phrase_ok = false; break; }
             }
-            if (phrase_ok) {
-                cur = ptr;
-                for (int j = (int)seed_idx - 1; j >= 0; --j) {
-                    while (cur > doc_start && CHAR_MAP[(uint8_t)*(cur - 1)] == 0) cur--;
-                    size_t wlen = p_views[j].size();
-                    if (cur - wlen < doc_start) { phrase_ok = false; break; }
-                    const char* w_start = cur - wlen;
-                    if (w_start > doc_start && CHAR_MAP[(uint8_t)*(w_start - 1)] != 0) { phrase_ok = false; break; }
-                    for (size_t b = 0; b < wlen; ++b) {
-                        if (CHAR_MAP[(uint8_t)w_start[b]] != (uint8_t)p_views[j][b]) { phrase_ok = false; break; }
-                    }
-                    if (!phrase_ok) break;
-                    cur = w_start;
-                }
-                if (phrase_ok) return true;
+
+            if (!phrase_ok) {
+                ptr += seed_len;
+                continue;
             }
+
+            cur = ptr;
+            for (int j = (int)seed_idx - 1; j >= 0; --j) {
+                while (cur > doc_start && CHAR_MAP[(uint8_t)*(cur - 1)] == 0) cur--;
+                size_t wlen = p_views[j].size();
+                if (cur - wlen < doc_start) { phrase_ok = false; break; }
+                const char* w_start = cur - wlen;
+                if (w_start > doc_start && CHAR_MAP[(uint8_t)*(w_start - 1)] != 0) { phrase_ok = false; break; }
+                for (size_t b = 0; b < wlen; ++b) {
+                    if (CHAR_MAP[(uint8_t)w_start[b]] != (uint8_t)p_views[j][b]) {
+                        phrase_ok = false;
+                        break;
+                    }
+                }
+                if (!phrase_ok) break;
+                cur = w_start;
+            }
+
+            if (phrase_ok) return true;
             ptr += seed_len;
         }
+
         return false;
     };
 
@@ -975,7 +941,7 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                std::vector<uint32_t> matches;
+                std::vector<uint32_t> candidates;
                 size_t seed_idx = 0;
 
                 if (all_hot) {
@@ -989,11 +955,11 @@ int main(int argc, char** argv) {
                         uint64_t word = bitset_cur[w];
                         while (word != 0) {
                             uint32_t bit = __builtin_ctzll(word);
-                            uint32_t d = w * 64 + bit;
-                            if (seed_phrase_match(d, p_views, k, 0)) matches.push_back(d);
+                            candidates.push_back(w * 64 + bit);
                             word &= (word - 1);
                         }
                     }
+                    seed_idx = 0;
                 } else {
                     size_t min_idx = SIZE_MAX;
                     uint32_t min_size = UINT32_MAX;
@@ -1055,12 +1021,15 @@ int main(int argc, char** argv) {
                                     break;
                                 }
                             }
-                            if (has_all) {
-                                if (seed_phrase_match(d, p_views, k, seed_idx)) {
-                                    matches.push_back(d);
-                                }
-                            }
+                            if (has_all) candidates.push_back(d);
                         }
+                    }
+                }
+
+                std::vector<uint32_t> matches;
+                for (uint32_t d : candidates) {
+                    if (seed_phrase_match(d, p_views, k, seed_idx)) {
+                        matches.push_back(d);
                     }
                 }
 
