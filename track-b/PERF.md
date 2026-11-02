@@ -33,3 +33,27 @@
   3. Parallelized `docs.txt` line slicing across 12 threads.
   4. Implemented a 16-bit lookup table `WORD_BIT_SUM` to compute set-bit position sums in $O(1)$ instructions without looping over individual bits.
 - **Measurement**: Peak memory dropped by >350 MB down to ~100 MB. Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+## Step 6: Single-Pass Document Tokenization, Direct 64-bit Hash Lookup & Rolling Ring Buffer Phrase Matcher
+- **Hypothesis**: Scanning the 253.8 MB file twice during document indexing doubled L3 cache misses. String `std::memcmp` lookups on every token in the hash table caused branch mispredictions. Re-tokenizing whole documents for phrase candidate matching spent unnecessary time when candidate phrases are only 2 to 8 tokens long.
+- **Implementation**:
+  1. Implemented a 256-byte `CHAR_MAP` lookup table to categorize and lowercase ASCII bytes in 1 instruction.
+  2. Transitioned to single-pass document tokenization: documents are tokenized directly into thread-local arrays with on-the-fly counting, followed by a fast memory-to-memory scatter into the flat CSR postings buffer (19.6 ms).
+  3. Replaced string `std::memcmp` in `TermTable::lookup` with direct 64-bit FNV-1a hash matching (0 collisions across 75,747 terms).
+  4. Replaced full document tokenization in phrase queries with an 8-entry rolling ring buffer `TokHistory hist[8]` and 32-bit djb2 hash matching, short-circuiting instantly upon candidate discovery.
+- **Measurement**: Local wall clock time dropped from 1,160 ms to 560 ms (over 2x faster). Correctness 100% verified with exact SHA-256 match `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+## Step 7: SIMD AVX2/NEON Bitset Queries, Zero-Allocation Output Buffering & Parallel Bitset Precomputation
+- **Hypothesis**: Word-by-word bitset evaluation in 31,000 BOOL queries incurred high instruction overhead. Allocating 50,000 individual `std::string` objects for query outputs caused allocator churn. Candidate filtering in phrase queries repeatedly binary-searched large posting lists even for high-df terms whose bitsets could be tested in $O(1)$ time. Precomputing hot bitsets sequentially cost 20+ ms.
+- **Implementation**:
+  1. Implemented explicit AVX2 SIMD intrinsics (`_mm256_and_si256`, `_mm256_or_si256`, `_mm256_andnot_si256`) with ARM NEON (`vandq_u64`, `vorrq_u64`, `vbicq_u64`) and portable fallbacks for bitset boolean queries.
+  2. Substituted per-query `std::string` allocations with thread-local output string buffers (`thread_outputs[t].reserve(...)`), streaming directly to `write(out_fd, ...)`.
+  3. Parallelized bitset precomputation across worker threads for terms with $(df \ge 1000 \land freq \ge 20) \lor df \ge 7800$.
+  4. In phrase queries, candidate documents are checked against precomputed bitsets via $O(1)$ bit test (`(bptr[d / 64] >> (d % 64)) & 1`), skipping binary search for common terms.
+- **Measurement**:
+  - Local wall clock time dropped to **0.40 s** (down from 1.48 s baseline, ~3.7x faster).
+  - User CPU time dropped to **2.92 s** (down from 6.85 s baseline).
+  - Retired instructions dropped from **36.16 billion to 13.93 billion** (a reduction of 22.2 billion instructions, or -61.5%).
+  - Cycles elapsed dropped from **17.10 billion to 7.85 billion** (-54%).
+  - Output SHA-256 hash verified 100% bit-for-bit exact: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+

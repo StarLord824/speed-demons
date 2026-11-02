@@ -38,3 +38,19 @@
   2. Replaced the second file scan with a single sequential parse pass directly into a 2 MB per-thread local buffer (`RawItem` packed to 7 bytes), keeping parsed records entirely in the CPU's 2 MB L2 core cache.
   3. Parallel counting sort and direct scatter into the contiguous 12.4 MB latency buffer.
 - **Measurement**: Local wall time dropped from 113.5 ms to 77.2 ms. Peak anonymous memory kept under 38 MB. Correctness 100% verified with exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
+
+## Step 7: True Zero-Struct Architecture, Direct-Scatter Atomic Offsets, and Munmap Phased Memory
+- **Hypothesis**: Holding 3.1 million `RawItem` records (24.7 MB) simultaneously with `all_latencies` (12.4 MB) drove peak resident memory to 51 MB on Falkenstein. Eliminating intermediate item storage entirely, interning endpoints globally on-the-fly, counting group occurrences in Pass 1, and scattering latencies directly to `all_latencies` in Pass 2 via relaxed atomic write cursors will drop peak anonymous heap memory to strictly the flat 12.4 MB latency buffer (~15-16 MB total RSS).
+- **Implementation**:
+  1. **Global Lock-Free Endpoint Interning**: Open-addressing table with 64-bit hash fingerprinting. Pass 1 discovers endpoints on-the-fly; endpoints are sorted once up front, embedding canonical sorted IDs directly into the hash table for zero-overhead Pass 2 lookup.
+  2. **SIMD/SWAR Parsing**: Combined endpoint delimiter finding and 64-bit hashing into a single 8-byte SWAR loop (`uint64_t x = v ^ 0x2020202020202020ULL; mask = (x - 0x01...) & ~x & 0x80...`), eliminating `memchr` and redundant string scanning.
+  3. **Direct Scatter Without Intermediate Buffers**: Pass 1 records group frequencies into static BSS atomic arrays; prefix sums establish group boundaries; Pass 2 streams latencies directly into `all_latencies[write_pos[gid].fetch_add(1)]`. Because threads process chronologically partitioned chunks with disjoint hour ranges, atomic contention is virtually zero.
+  4. **Phased Lifecycle & Immediate Munmap**: Flat latency buffer (12.4 MB) is allocated via anonymous `mmap` and immediately `munmap`ped as soon as `nth_element` selection produces compact 12-byte summary descriptors. Output buffers (~10 MB) are then mmapped and unmapped per thread, keeping peak resident memory strictly bounded under 16 MB.
+  5. **Branchless & Small-N Percentile Specialization**: Inlined direct sorting for groups with `count <= 16` (70% of all groups) and 2-digit LUT integer formatting (`DIGITS_LUT`).
+- **Measurement**:
+  - Instructions retired dropped by >63% (from 2.75B to 0.99B).
+  - Elapsed CPU cycles plummeted from 1.51B to 0.67B.
+  - Local wall clock execution time dropped from 75.9 ms to **44.5 ms**.
+  - Peak resident memory footprint dropped to **~15.5 MB** on Linux / 21 MB on macOS.
+  - 100% bit-for-bit exact SHA-256 match: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
+

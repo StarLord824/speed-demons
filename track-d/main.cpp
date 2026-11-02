@@ -34,61 +34,147 @@ inline char* i64_to_str(char* buf, int64_t val) {
 
 // Fast integer parsing from pointer
 inline uint32_t parse_u32(const char*& ptr) {
-    uint32_t val = 0;
-    while (*ptr >= '0' && *ptr <= '9') {
+    uint32_t val = *ptr++ - '0';
+    while (*ptr >= '0') {
         val = val * 10 + (*ptr++ - '0');
     }
     return val;
 }
 
-// 4-ary Min-Heap with packed (dist << 21 | u)
-struct Fast4AryHeap {
-    std::vector<uint64_t> data;
+// 64-bit Radix Heap for O(1) integer priority queue operations
+struct RadixHeap64 {
+    struct Item {
+        uint64_t key;
+        uint32_t val;
+    };
+    std::vector<Item> buckets[65];
+    uint64_t last = 0;
+    size_t sz = 0;
+    uint64_t non_empty_mask = 0;
 
-    void reserve(size_t cap) { data.reserve(cap); }
-    void clear() { data.clear(); }
-    bool empty() const { return data.empty(); }
-
-    void push(uint64_t val) {
-        size_t idx = data.size();
-        data.push_back(val);
-        while (idx > 0) {
-            size_t parent = (idx - 1) >> 2;
-            if (val < data[parent]) {
-                data[idx] = data[parent];
-                idx = parent;
-            } else {
-                break;
-            }
-        }
-        data[idx] = val;
+    void reserve() {
+        for (int i = 0; i < 65; ++i) buckets[i].reserve(1024);
     }
 
-    uint64_t pop() {
-        uint64_t ret = data[0];
-        uint64_t last = data.back();
-        data.pop_back();
-        if (!data.empty()) {
-            size_t idx = 0;
-            size_t n = data.size();
-            while (true) {
-                size_t child = (idx << 2) + 1;
-                if (child >= n) break;
-                size_t best = child;
-                size_t end_child = std::min(child + 4, n);
-                for (size_t c = child + 1; c < end_child; ++c) {
-                    if (data[c] < data[best]) best = c;
-                }
-                if (data[best] < last) {
-                    data[idx] = data[best];
-                    idx = best;
-                } else {
-                    break;
+    void clear() {
+        while (non_empty_mask) {
+            int b = __builtin_ctzll(non_empty_mask);
+            buckets[b].clear();
+            non_empty_mask &= non_empty_mask - 1;
+        }
+        last = 0;
+        sz = 0;
+    }
+
+    bool empty() const { return sz == 0; }
+
+    inline void push(uint64_t key, uint32_t val) {
+        int b = (key == last) ? 0 : 64 - __builtin_clzll(key ^ last);
+        buckets[b].push_back({key, val});
+        non_empty_mask |= (1ULL << b);
+        sz++;
+    }
+
+    inline Item pop() {
+        if (!(non_empty_mask & 1)) {
+            int b = __builtin_ctzll(non_empty_mask);
+            uint64_t new_last = buckets[b][0].key;
+            for (size_t i = 1; i < buckets[b].size(); ++i) {
+                if (buckets[b][i].key < new_last) {
+                    new_last = buckets[b][i].key;
                 }
             }
-            data[idx] = last;
+            last = new_last;
+            non_empty_mask &= ~(1ULL << b);
+            for (size_t i = 0; i < buckets[b].size(); ++i) {
+                auto item = buckets[b][i];
+                int nb = (item.key == last) ? 0 : 64 - __builtin_clzll(item.key ^ last);
+                buckets[nb].push_back(item);
+                non_empty_mask |= (1ULL << nb);
+            }
+            buckets[b].clear();
         }
+        auto ret = buckets[0].back();
+        buckets[0].pop_back();
+        if (buckets[0].empty()) non_empty_mask &= ~1ULL;
+        sz--;
         return ret;
+    }
+};
+
+// Compact flat hash map: 8 bytes per slot packed (dist << 21 | node)
+struct FlatMap64 {
+    std::vector<uint64_t> slots;
+    std::vector<uint32_t> touched;
+    uint32_t mask;
+    uint32_t count;
+
+    FlatMap64(size_t cap = 65536) {
+        slots.resize(cap, UINT64_MAX);
+        mask = (uint32_t)(cap - 1);
+        count = 0;
+        touched.reserve(cap);
+    }
+
+    void clear() {
+        for (uint32_t idx : touched) {
+            slots[idx] = UINT64_MAX;
+        }
+        touched.clear();
+        count = 0;
+    }
+
+    void grow() {
+        size_t new_cap = slots.size() * 2;
+        std::vector<uint64_t> old_slots(new_cap, UINT64_MAX);
+        slots.swap(old_slots);
+        mask = (uint32_t)(new_cap - 1);
+        std::vector<uint32_t> old_touched;
+        old_touched.swap(touched);
+        touched.reserve(new_cap);
+        for (uint32_t old_idx : old_touched) {
+            uint64_t entry = old_slots[old_idx];
+            uint32_t node = (uint32_t)(entry & 0x1FFFFF);
+            uint32_t idx = (node * 0x9e3779b9u) & mask;
+            while (slots[idx] != UINT64_MAX) idx = (idx + 1) & mask;
+            slots[idx] = entry;
+            touched.push_back(idx);
+        }
+    }
+
+    inline bool update(uint32_t node, uint64_t nd) {
+        if (__builtin_expect(count * 2 >= slots.size(), 0)) {
+            grow();
+        }
+        uint32_t idx = (node * 0x9e3779b9u) & mask;
+        while (true) {
+            uint64_t entry = slots[idx];
+            if ((uint32_t)(entry & 0x1FFFFF) == node) {
+                uint64_t old_d = entry >> 21;
+                if (nd < old_d) {
+                    slots[idx] = (nd << 21) | node;
+                    return true;
+                }
+                return false;
+            }
+            if (entry == UINT64_MAX) {
+                slots[idx] = (nd << 21) | node;
+                touched.push_back(idx);
+                count++;
+                return true;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    inline uint64_t get(uint32_t node) const {
+        uint32_t idx = (node * 0x9e3779b9u) & mask;
+        while (true) {
+            uint64_t entry = slots[idx];
+            if ((uint32_t)(entry & 0x1FFFFF) == node) return entry >> 21;
+            if (entry == UINT64_MAX) return UINT64_MAX;
+            idx = (idx + 1) & mask;
+        }
     }
 };
 
@@ -117,6 +203,7 @@ int main(int argc, char** argv) {
     uint32_t n = parse_u32(gptr);
     while (*gptr == ' ') gptr++;
     uint32_t m = parse_u32(gptr);
+    (void)m;
     while (*gptr != '\n') gptr++;
     gptr++; // first byte of edges
 
@@ -139,8 +226,7 @@ int main(int argc, char** argv) {
         chunk_starts[t] = approx;
     }
 
-    // Memory-efficient CSR construction:
-    // head array of atomics (only 7 MB)
+    // Memory-efficient CSR construction
     std::vector<std::atomic<uint32_t>> atomic_head(n + 1);
     std::vector<std::atomic<uint8_t>> atomic_has_in(n);
     for (uint32_t i = 0; i <= n; ++i) atomic_head[i].store(0, std::memory_order_relaxed);
@@ -152,11 +238,9 @@ int main(int argc, char** argv) {
             const char* ptr = chunk_starts[t];
             const char* end = chunk_starts[t + 1];
             while (ptr < end) {
-                uint32_t u = parse_u32(ptr);
-                ptr++; // ' '
-                uint32_t v = parse_u32(ptr);
-                ptr++; // ' '
-                while (*ptr >= '0' && *ptr <= '9') ptr++;
+                uint32_t u = parse_u32(ptr); ptr++;
+                uint32_t v = parse_u32(ptr); ptr++;
+                while (*ptr >= '0') ptr++;
                 if (ptr < end && *ptr == '\n') ptr++;
                 atomic_head[u].fetch_add(1, std::memory_order_relaxed);
                 atomic_has_in[v].store(1, std::memory_order_relaxed);
@@ -181,7 +265,7 @@ int main(int argc, char** argv) {
     // Free atomic_has_in early
     std::vector<std::atomic<uint8_t>>().swap(atomic_has_in);
 
-    // Reuse atomic_head as atomic write cursor (head_cur)
+    // Reuse atomic_head as atomic write cursor
     for (uint32_t u = 0; u < n; ++u) {
         atomic_head[u].store(head[u], std::memory_order_relaxed);
     }
@@ -193,10 +277,8 @@ int main(int argc, char** argv) {
             const char* ptr = chunk_starts[t];
             const char* end = chunk_starts[t + 1];
             while (ptr < end) {
-                uint32_t u = parse_u32(ptr);
-                ptr++; // ' '
-                uint32_t v = parse_u32(ptr);
-                ptr++; // ' '
+                uint32_t u = parse_u32(ptr); ptr++;
+                uint32_t v = parse_u32(ptr); ptr++;
                 uint32_t w = parse_u32(ptr);
                 if (ptr < end && *ptr == '\n') ptr++;
                 uint32_t pos = atomic_head[u].fetch_add(1, std::memory_order_relaxed);
@@ -242,25 +324,24 @@ int main(int argc, char** argv) {
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
+    std::atomic<size_t> query_idx{0};
 
-    // 4. Parallel query answering with 12 threads
+    // 3. Parallel query answering with dynamic load balancing
     unsigned int num_query_threads = 12;
     if (std::thread::hardware_concurrency() > 0 && num_query_threads > std::thread::hardware_concurrency()) {
         num_query_threads = std::thread::hardware_concurrency();
     }
 
     for (unsigned int t = 0; t < num_query_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            size_t start_q = (num_queries * t) / num_query_threads;
-            size_t end_q = (num_queries * (t + 1)) / num_query_threads;
+        workers.emplace_back([&]() {
+            FlatMap64 map(65536);
+            RadixHeap64 rh;
+            rh.reserve();
 
-            // state[u]: [63..43: epoch (21 bits)][42..0: dist (43 bits)]
-            std::vector<uint64_t> state(n, 0);
-            uint32_t epoch = 0;
-            Fast4AryHeap pq;
-            pq.reserve(65536);
+            while (true) {
+                size_t qi = query_idx.fetch_add(1, std::memory_order_relaxed);
+                if (qi >= num_queries) break;
 
-            for (size_t qi = start_q; qi < end_q; ++qi) {
                 uint32_t s = queries[qi].s;
                 uint32_t trg = queries[qi].t;
 
@@ -270,31 +351,25 @@ int main(int argc, char** argv) {
                 }
 
                 // Instant reachability prunes:
-                if (!has_in_edge[trg]) {
-                    answers[qi] = -1;
-                    continue;
-                }
-                if (head[s + 1] == head[s]) {
+                if (!has_in_edge[trg] || head[s + 1] == head[s]) {
                     answers[qi] = -1;
                     continue;
                 }
 
-                epoch++;
-                state[s] = ((uint64_t)epoch << 43); // dist = 0
-                pq.clear();
-                pq.push(s); // (dist 0 << 21) | s
+                map.clear();
+                rh.clear();
+                map.update(s, 0);
+                rh.push(0, s);
 
                 int64_t ans = -1;
                 uint32_t popped = 0;
-                while (!pq.empty()) {
+                while (!rh.empty()) {
                     if (++popped > 250000) break;
-                    uint64_t top = pq.pop();
-                    uint64_t top_dist = top >> 21;
-                    uint32_t u = (uint32_t)(top & ((1ULL << 21) - 1));
+                    auto top = rh.pop();
+                    uint64_t top_dist = top.key;
+                    uint32_t u = top.val;
 
-                    uint64_t u_state = state[u];
-                    if ((u_state >> 43) != epoch) continue;
-                    uint64_t cur_d = u_state & ((1ULL << 43) - 1);
+                    uint64_t cur_d = map.get(u);
                     if (top_dist > cur_d) continue;
 
                     if (u == trg) {
@@ -307,16 +382,8 @@ int main(int argc, char** argv) {
                     for (uint32_t e = start_e; e < end_e; ++e) {
                         uint32_t v = edges[e].to;
                         uint64_t nd = top_dist + edges[e].weight;
-                        uint64_t v_state = state[v];
-                        if ((v_state >> 43) != epoch) {
-                            state[v] = ((uint64_t)epoch << 43) | nd;
-                            pq.push((nd << 21) | v);
-                        } else {
-                            uint64_t old_d = v_state & ((1ULL << 43) - 1);
-                            if (nd < old_d) {
-                                state[v] = ((uint64_t)epoch << 43) | nd;
-                                pq.push((nd << 21) | v);
-                            }
+                        if (map.update(v, nd)) {
+                            rh.push(nd, v);
                         }
                     }
                 }
@@ -327,7 +394,7 @@ int main(int argc, char** argv) {
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // 5. Write answers to /out/distances.txt
+    // 4. Write answers to /out/distances.txt
     std::string out_buf;
     out_buf.reserve(num_queries * 12);
     char num_tmp[32];
